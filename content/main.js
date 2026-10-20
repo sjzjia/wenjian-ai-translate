@@ -166,6 +166,8 @@
         // 用节点当前值做还原依据：切段写入前它仍是完整原文
         original: it.node.nodeValue,
         block: it.block,
+        // 写入的译文：完成时用它核对译文是否还留在页面上
+        appliedText: out,
         applied: null
       };
       const ok = state.config.bilingual
@@ -370,13 +372,32 @@
     if (state.records.length) {
       const total = since();
       const first = tFirst || total;
+      // 落地自检：写入成功不等于译文还留在页面上。React / Vue 这类框架
+      // 在翻译过程中重渲染，会用自身 state 把文本节点覆盖回原文；
+      // 而此时 MutationObserver 还没建立（它要等 done 之后才启动），
+      // 没人补译，于是会出现「records 有 48 条、页面却还是英文」
+      const lost = state.records.filter((r) =>
+        r.applied
+          ? !(r.applied[1] && r.applied[1].isConnected)
+          : !r.node || !r.node.isConnected || r.node.nodeValue !== r.appliedText
+      ).length;
+
       // 控制台留一份完整数据：批次数、并发、三段耗时，排查慢在哪里直接看这里
       console.info(
         `[LLMT] 收集 ${Math.round(tCollect)}ms · 首译文 ${Math.round(first)}ms · 全部 ${Math.round(total)}ms · ` +
-          `${batches.length} 批 / 并发 ${concurrency}`
+          `${batches.length} 批 / 并发 ${concurrency}` +
+          (lost ? ` · 落地失败 ${lost} 段` : '')
       );
+
+      // 页面已经稳定、不再变化，observer 永远收不到信号，只能主动补一轮
+      if (lost) {
+        followRoots.clear();
+        scheduleRescan(0);
+      }
+
       UI.flashToast(
         `${failed ? `翻译完成，${failed} 段失败（可重试）` : `翻译完成，共 ${state.records.length} 段`}` +
+          (lost ? `（${lost} 段被页面改回，正在补译）` : '') +
           ` · 首译 ${(first / 1000).toFixed(1)}s / 总 ${(total / 1000).toFixed(1)}s`,
         4000
       );

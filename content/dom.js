@@ -149,11 +149,16 @@
    */
   function nearestBlock(node) {
     let el = node.nodeType === 1 ? node : node.parentElement;
+    const first = el;
     let depth = 0;
     while (el && el !== document.body && el !== document.documentElement && depth++ < 6) {
       if (!INLINE_TAGS.has(el.tagName)) return el;
       el = el.parentElement;
     }
+    // 祖先全是行内元素时不要回退到 body：markDone 拒绝给 body 打标记，
+    // 这段文本每次都会被当成新内容重新译一遍，白花 token。
+    // 退回最近的元素，标记才有地方落
+    if (first && first !== document.body && first !== document.documentElement) return first;
     return el || document.body;
   }
 
