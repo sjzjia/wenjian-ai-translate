@@ -184,37 +184,125 @@ function isLocalEndpoint(baseUrl) {
   }
 }
 
+/** 模型名里的推理模型特征：认不出平台时靠它决定要不要试一次关闭参数 */
+const REASONING_MODEL_RE =
+  /(qwen3|thinking|reasoner|(^|[-_/.])r1|qwq|glm-4\.5|kimi-k2|seed-1\.6|magistral|grok-[34])/i;
+
 /**
- * 关闭「思考模式」需要附加的请求参数，按接口地址识别厂商。
+ * 关闭「思考模式」需要附加的请求参数，按平台识别。
  * 翻译是确定性任务，思考链纯属浪费：既计费又拖慢首字，
  * 部分本地框架（vLLM / SGLang 的 Qwen3）还会把思考内容混进正文干扰解析。
- * 识别不出厂商时返回 {}：绝不乱塞参数，严格校验的接口会直接 400。
+ *
+ * 各家的开关字段互不兼容，只能硬编码。猜错的代价由 paramCompat 兜住：
+ * 同一个「host+模型」只会白付一次 400，之后自动剔除该参数（见 rememberDropped）。
+ * 所以这里可以放宽识别，不必为了安全一律返回 {}。
  */
-function thinkingParams(baseUrl) {
+function thinkingParams(baseUrl, model) {
   let host = '';
   try {
     host = new URL(baseUrl).host.toLowerCase();
   } catch {
     return {};
   }
-  if (host.includes('ollama') || (isLocalEndpoint(baseUrl) && host.includes(':11434'))) {
-    // Ollama 0.9+ 支持 think 开关；更早的版本会忽略未知字段
-    return { think: false };
-  }
-  if (host.includes('dashscope.aliyuncs.com')) {
-    // 通义千问 qwen3 系列
+  const m = String(model || '');
+
+  // Ollama 原生接口：0.9+ 支持 think，更早版本忽略未知字段
+  if (host.includes('ollama') || host.endsWith(':11434')) return { think: false };
+
+  // enable_thinking：通义、硅基流动、混元、千帆、腾讯云、各类 one-api 转发 Qwen3
+  if (
+    host.includes('dashscope') ||
+    host.includes('aliyuncs') ||
+    host.includes('siliconflow') ||
+    host.includes('hunyuan') ||
+    host.includes('tencent') ||
+    host.includes('baidubce') ||
+    host.includes('qianfan') ||
+    host.includes('modelscope')
+  ) {
     return { enable_thinking: false };
   }
-  if (host.includes('bigmodel.cn')) {
-    // 智谱 GLM-4.5 起支持 thinking 开关
+
+  // thinking.type：智谱、DeepSeek、火山方舟、月之暗面
+  if (
+    host.includes('bigmodel') ||
+    host.includes('deepseek') ||
+    host.includes('volces') ||
+    host.includes('ark.cn') ||
+    host.includes('moonshot')
+  ) {
     return { thinking: { type: 'disabled' } };
   }
-  if (host.includes('deepseek')) {
-    // DeepSeek V3.1+ 混合思考模型支持 thinking 开关；
-    // 更早的 deepseek-reasoner 关不掉，只能换 deepseek-chat（不支持时靠 400 重试兜底）
-    return { thinking: { type: 'disabled' } };
-  }
+
+  // OpenRouter 用统一的 reasoning 字段，可关掉推理
+  if (host.includes('openrouter')) return { reasoning: { enabled: false } };
+
+  // OpenAI o 系列：o3 / o4-mini 支持 minimal；o1 只接受 low，被拒后由记忆剔除
+  if (host.includes('openai.com') && /^o[134]/.test(m)) return { reasoning_effort: 'minimal' };
+
+  // 其余（自建 vLLM / SGLang / one-api / 各类网关）：
+  // 只有模型名像推理模型时才试一次，普通模型乱加参数只会换来 400
+  if (REASONING_MODEL_RE.test(m)) return { enable_thinking: false };
   return {};
+}
+
+/* ------------------------------------------------------------------ */
+/* 参数兼容性记忆                                                      */
+/*                                                                     */
+/* 接口不认识的参数会 400。原来的做法是每次请求现剥现重发，于是一个    */
+/* 不兼容的参数会让「每个批次」都白付一次完整输入（20 批 = 20 次）。  */
+/* 这里按「host+模型」记住被拒过的参数，之后构造请求时直接不发。      */
+/* ------------------------------------------------------------------ */
+
+const COMPAT_STORE = 'paramCompat';
+let compatMap = null;      // Map<`host|model`, Set<参数名>>
+let compatSaveTimer = null;
+
+function compatKeyOf(baseUrl, model) {
+  let host = '';
+  try {
+    host = new URL(baseUrl).host.toLowerCase();
+  } catch {
+    /* 地址不合法时按模型名归类即可 */
+  }
+  return `${host}|${String(model || '').toLowerCase()}`;
+}
+
+async function loadCompat() {
+  if (compatMap) return compatMap;
+  compatMap = new Map();
+  try {
+    const { [COMPAT_STORE]: raw } = await chrome.storage.local.get({ [COMPAT_STORE]: {} });
+    for (const [k, v] of Object.entries(raw || {})) {
+      if (Array.isArray(v) && v.length) compatMap.set(k, new Set(v));
+    }
+  } catch {
+    /* 读不到就当没有记忆，不影响翻译 */
+  }
+  return compatMap;
+}
+
+/** 同步取用：请求前剔除已知不被支持的参数 */
+function droppedParams(baseUrl, model) {
+  if (!compatMap) return null;
+  return compatMap.get(compatKeyOf(baseUrl, model)) || null;
+}
+
+/** 记录一个被接口拒绝的参数，攒 300ms 合并落盘（并发批次会同时命中 400） */
+function rememberDropped(baseUrl, model, param) {
+  if (!compatMap || !param) return;
+  const k = compatKeyOf(baseUrl, model);
+  const set = compatMap.get(k) || new Set();
+  if (set.has(param)) return;
+  set.add(param);
+  compatMap.set(k, set);
+  if (compatSaveTimer) return;
+  compatSaveTimer = setTimeout(() => {
+    compatSaveTimer = null;
+    const obj = {};
+    for (const [key, s] of compatMap) obj[key] = [...s];
+    chrome.storage.local.set({ [COMPAT_STORE]: obj }).catch(() => {});
+  }, 300);
 }
 
 /** 去掉内联在正文里的思考内容：<think>…</think>、<think>…</think>、<reasoning>…</reasoning> */
@@ -257,10 +345,18 @@ async function postChat(baseUrl, apiKey, body) {
   }
 }
 
+/**
+ * 全局限流冷却。并发批次各自撞 429、各自退避，退避结束后又会同时打过去，
+ * 实际请求数被放大到「并发 × 重试次数」。命中 429 后统一推迟所有请求。
+ */
+let rateLimitUntil = 0;
+
 /** 带退避重试的请求：429 / 5xx 等临时错误重试，其余立即返回 */
 async function requestChat(baseUrl, apiKey, body) {
   let last = null;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+    const cool = rateLimitUntil - Date.now();
+    if (cool > 0) await new Promise((r) => setTimeout(r, Math.min(cool, 10000)));
     try {
       last = await postChat(baseUrl, apiKey, body);
     } catch (e) {
@@ -277,6 +373,8 @@ async function requestChat(baseUrl, apiKey, body) {
       Number.isFinite(after) && after > 0
         ? Math.min(after * 1000, 10000)
         : 1000 * Math.pow(2, attempt) + Math.floor(Math.random() * 300);
+    // 429 拉高全局冷却，让并发中的其它请求一起让路，避免重试风暴
+    if (last.status === 429) rateLimitUntil = Math.max(rateLimitUntil, Date.now() + wait);
     await new Promise((r) => setTimeout(r, wait));
   }
   return last;
@@ -358,10 +456,17 @@ async function callChat(messages, opts = {}) {
   // 不再发送 response_format：翻译协议已改成「编号|译文」的纯文本行，
   // 强制 JSON 会和提示词冲突，逐条兜底时还会把 JSON 原文当译文写进页面。
 
-  // 关闭思考模式（默认开）：按接口地址附加厂商参数，识别不出就不加
-  const thinkOpts = cfg.disableThinking === false ? {} : thinkingParams(baseUrl);
+  // 关闭思考模式（默认开）：按接口地址与模型名附加厂商参数
+  const thinkOpts = cfg.disableThinking === false ? {} : thinkingParams(baseUrl, model);
   const thinkKeys = Object.keys(thinkOpts);
   Object.assign(body, thinkOpts);
+
+  // 剔除该「host+模型」此前明确拒绝过的参数：否则每个批次都要重演一次 400
+  await loadCompat();
+  const rejected = droppedParams(baseUrl, model);
+  if (rejected) {
+    for (const k of rejected) delete body[k];
+  }
 
   // 输出上限：按输入体量估算，留足余量不截断正常译文，但能挡住模型跑题无限生成。
   // 本地推理模型没有默认输出限制，跑题时会把一次请求拖到几分钟
@@ -373,15 +478,17 @@ async function callChat(messages, opts = {}) {
 
   if (!res.ok) {
     let raw = await res.text().catch(() => '');
-    // 接口不认识的参数逐个剥掉重试（temperature / 思考参数 / 输出上限），最多两次。
-    // 老版本 Ollama、不支持思考开关的模型、限制取值范围的网关都走这条路
+    // 接口不认识的参数逐个剥掉重试（temperature / 思考参数 / 输出上限）。
+    // 老版本 Ollama、不支持思考开关的模型、限制取值范围的网关都走这条路。
+    // 每剥掉一个就记进 paramCompat，后续请求直接不发，不必再付一次 400 的输入钱
     const optional = ['temperature', ...thinkKeys, limitKey].filter((k) => k in body);
-    for (let i = 0; i < 2 && !res.ok && res.status === 400 && optional.length; i++) {
+    for (let i = 0; i < 3 && !res.ok && res.status === 400 && optional.length; i++) {
       const lower = raw.toLowerCase();
       const bad = optional.find((k) => lower.includes(k.toLowerCase()));
       if (!bad) break;
       delete body[bad];
       optional.splice(optional.indexOf(bad), 1);
+      rememberDropped(baseUrl, model, bad);
       res = await requestChat(baseUrl, apiKey, body);
       raw = res.ok ? '' : await res.text().catch(() => '');
     }
@@ -497,10 +604,9 @@ async function streamChat(messages, onDelta) {
   if (cfg.temperature !== null && cfg.temperature !== undefined && cfg.temperature >= 0) {
     body.temperature = Number(cfg.temperature);
   }
-  // 关闭思考模式（默认开）：按接口地址附加厂商参数，识别不出就不加。
-  // 流式不支持 400 自动重试，参数不被接受时会抛错，由上层降级到非流式重发
+  // 关闭思考模式（默认开）：按接口地址与模型名附加厂商参数
   if (cfg.disableThinking !== false) {
-    Object.assign(body, thinkingParams(baseUrl));
+    Object.assign(body, thinkingParams(baseUrl, model));
   }
   // 输出上限：挡住模型跑题无限生成（本地推理模型无默认限制，跑题能把请求拖到几分钟）。
   // 被接口拒绝时上层会降级到非流式，那里有 400 自动剥参数重试
@@ -508,6 +614,14 @@ async function streamChat(messages, onDelta) {
     8192,
     Math.ceil(messages.reduce((s, m) => s + String(m.content || '').length, 0) * 2) + 300
   );
+
+  // 流式没有 400 自动剥离，参数被拒就是整批失败，所以先按记忆剔除已知不兼容项。
+  // 这条记忆由非流式路径探测写入，第一次流式失败后，后续批次就不再撞同一个墙
+  await loadCompat();
+  const rejected = droppedParams(baseUrl, model);
+  if (rejected) {
+    for (const k of rejected) delete body[k];
+  }
 
   const headers = {
     'Content-Type': 'application/json',
@@ -531,6 +645,19 @@ async function streamChat(messages, onDelta) {
       const raw = await res.text().catch(() => '');
       // 端点不存在 / 方法不允许：这个接口没有流式能力，记住它
       if (res.status === 404 || res.status === 405) streamUnsupported = true;
+      // 400 多半是某个可选参数不被接受。流式没有自动剥离，只能记下来，
+      // 让后续批次不再发送，避免每批都撞一次墙
+      if (res.status === 400) {
+        const lower = raw.toLowerCase();
+        const candidates = [
+          'temperature',
+          ...Object.keys(thinkingParams(baseUrl, model)),
+          outputLimitKey(baseUrl, model)
+        ];
+        for (const k of candidates) {
+          if (lower.includes(k.toLowerCase())) rememberDropped(baseUrl, model, k);
+        }
+      }
       throw httpError(res.status, raw, baseUrl);
     }
     if (!res.body) {
@@ -748,7 +875,9 @@ async function translateBatchStream(texts, targetLang, push) {
       await translateStreamCore(miss.map((i) => texts[i]), lang, cfg, (k, text) => {
         const idx = miss[k];
         out[idx] = text;
-        if (text !== texts[idx]) rememberTranslation(keyOf(texts[idx]), text);
+        // 原文即译文也写缓存：专有名词、代码标识符这类模型原样返回的条目，
+        // 不缓存的话每次翻译都要重新请求一遍（导航、页脚、表头在每个页面都出现）
+        rememberTranslation(keyOf(texts[idx]), text);
         push(idx, text);
       });
     } catch (e) {
@@ -776,7 +905,9 @@ async function translateBatchStream(texts, targetLang, push) {
         const text = res.translations[k];
         if (!text) return;
         out[idx] = text;
-        if (text !== texts[idx]) rememberTranslation(keyOf(texts[idx]), text);
+        // 原文即译文也写缓存：专有名词、代码标识符这类模型原样返回的条目，
+        // 不缓存的话每次翻译都要重新请求一遍（导航、页脚、表头在每个页面都出现）
+        rememberTranslation(keyOf(texts[idx]), text);
         push(idx, text);
       });
       flushCache();
@@ -883,13 +1014,11 @@ async function translateBatch(texts, targetLang) {
 
   miss.forEach((idx, k) => {
     const v = res.translations[k];
-    // 译文与原文相同（专有名词、已是目标语言）不写缓存
-    if (v && v !== texts[idx]) {
-      out[idx] = v;
-      rememberTranslation(keyOf(texts[idx]), v);
-    } else if (v) {
-      out[idx] = v;
-    }
+    if (!v) return;
+    out[idx] = v;
+    // 译文与原文相同（专有名词、已是目标语言）同样写缓存：
+    // 这类条目往往在导航、页脚反复出现，不缓存等于每次重译一遍
+    rememberTranslation(keyOf(texts[idx]), v);
   });
   flushCache();
 
@@ -927,7 +1056,30 @@ async function translateCore(texts, lang, cfg) {
     }
   } catch (e) {
     if (texts.length === 1) return { ok: false, error: e.message };
-    // 批量失败时降级为逐条，但先探测一条，避免配置错误导致大量无效请求
+    // 鉴权 / 地址 / 限流：拆开重发也必然失败，而且 429 拆半只会把请求数翻倍
+    if (e.status === 401 || e.status === 403 || e.status === 404 || e.status === 429) {
+      return { ok: false, error: e.message };
+    }
+    // 先拆半重试：批次过大导致的超时、输出被截断、网关单请求上限，拆开后往往直接成功。
+    // 原来直接逐条，一批 64 条会变成 64 次请求，每次都带一份完整 system prompt
+    if (texts.length > 8) {
+      const mid = Math.ceil(texts.length / 2);
+      const [a, b] = await Promise.all([
+        translateCore(texts.slice(0, mid), lang, cfg),
+        translateCore(texts.slice(mid), lang, cfg)
+      ]);
+      if (a.ok || b.ok) {
+        return {
+          ok: true,
+          translations: [
+            ...(a.ok ? a.translations : texts.slice(0, mid).map(() => '')),
+            ...(b.ok ? b.translations : texts.slice(mid).map(() => ''))
+          ]
+        };
+      }
+      return { ok: false, error: e.message };
+    }
+    // 小批次仍失败才逐条：先探测一条，避免配置错误导致大量无效请求
     const probe = await translateIndividually([texts[0]], lang, cfg);
     if (!probe[0]) return { ok: false, error: e.message };
     const rest = await translateIndividually(texts.slice(1), lang, cfg);

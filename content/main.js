@@ -548,14 +548,21 @@
         applyTranslation(groups, item.text, text.trim());
       });
 
-      // 流式不可用时逐条补，避免新内容整段漏译
+      // 流式与非流式都没覆盖到，用小批次再试一轮，避免新内容整段漏译。
+      // 原来逐条发送：64 条就是 64 次请求，每次都带一份完整 system prompt
       if (!res.ok && res.fallback) {
-        for (const t of texts) {
+        const retryBatches = DOM.batch(
+          texts.map((text) => ({ text })),
+          { maxChars: 600, maxItems: 8 }
+        ).map((b) => b.map((x) => x.text));
+        for (const rb of retryBatches) {
           if (state.status !== 'done') return;
-          const one = await send({ type: 'translateText', text: t });
-          if (one.ok && one.translation) {
-            applyTranslation(groups, t, one.translation.trim());
-          }
+          const one = await send({ type: 'translateBatch', texts: rb });
+          if (!one.ok || !Array.isArray(one.translations)) continue;
+          rb.forEach((t, k) => {
+            const v = one.translations[k];
+            if (v && v.trim()) applyTranslation(groups, t, v.trim());
+          });
         }
       }
     }

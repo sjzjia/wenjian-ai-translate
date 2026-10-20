@@ -58,7 +58,7 @@
           <div>
             <div class="switch-title">关闭思考模式</div>
             <div class="switch-desc">
-              翻译不需要推理链。按接口自动附加关闭参数（Ollama <code>think:false</code>、通义 <code>enable_thinking:false</code>、智谱 <code>thinking:disabled</code>），并清除混在正文里的思考内容，省 token 也更快。推理模型可取消勾选。
+              翻译不需要推理链，思考内容既计费又拖慢首字。按接口与模型名自动附加关闭参数：Ollama <code>think:false</code>、通义/硅基流动/混元/千帆 <code>enable_thinking:false</code>、智谱/DeepSeek/火山方舟/月之暗面 <code>thinking:disabled</code>、OpenRouter <code>reasoning:false</code>、OpenAI o 系列 <code>reasoning_effort:minimal</code>；其余网关在模型名像推理模型时也会尝试。被接口拒绝的参数会自动记住，后续不再发送。关不掉的推理模型可取消勾选。
             </div>
           </div>
           <label class="switch">
