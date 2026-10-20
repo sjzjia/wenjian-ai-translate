@@ -213,19 +213,247 @@ $('clearCacheBtn').addEventListener('click', async () => {
 
 /* ---------------- 用量统计 ---------------- */
 
+const HOUR_MS = 3600000;
+const CHART_HOURS = 24;
+
+let chartSeries = []; // 最近 24 个小时桶，按时间升序
+let chartHover = -1;
+let chartRaf = 0;
+let usageTimer = 0;
+
 async function loadUsage() {
   const el = $('usageText');
   if (!el) return;
-  const { usage } = await chrome.storage.local.get({ usage: { requests: 0, chars: 0 } });
+  const { usage } = await chrome.storage.local.get({
+    usage: { requests: 0, chars: 0, tokens: 0 }
+  });
   const req = Number(usage.requests || 0);
   const chars = Number(usage.chars || 0);
-  el.textContent = `已请求 ${req} 次，累计 ${chars.toLocaleString()} 字符（仅本地统计）`;
+  const tokens = Number(usage.tokens || 0);
+  el.textContent = `已请求 ${req} 次，累计 ${chars.toLocaleString()} 字符 / 约 ${tokens.toLocaleString()} tokens（仅本地统计）`;
+  await loadChart();
 }
 
+async function loadChart() {
+  const { usageHourly } = await chrome.storage.local.get({ usageHourly: [] });
+  const nowHour = Math.floor(Date.now() / HOUR_MS);
+  const map = new Map();
+  for (const b of Array.isArray(usageHourly) ? usageHourly : []) {
+    if (b && typeof b.h === 'number') map.set(b.h, b);
+  }
+  chartSeries = [];
+  // 固定 24 个槽位（当前小时往前 23 个），没有记录的小时补零，波形才不会跳
+  for (let i = CHART_HOURS - 1; i >= 0; i--) {
+    const h = nowHour - i;
+    const b = map.get(h);
+    chartSeries.push({ h, c: b ? Number(b.c) || 0 : 0, t: b ? Number(b.t) || 0 : 0 });
+  }
+  chartHover = -1;
+  hideTip();
+  drawChart();
+}
+
+function fmtShort(n) {
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1).replace(/\.0$/, '')}M`;
+  if (n >= 1e4) return `${(n / 1e3).toFixed(1).replace(/\.0$/, '')}k`;
+  return n.toLocaleString();
+}
+
+function hourLabel(h) {
+  const d = new Date(h * HOUR_MS);
+  return `${String(d.getHours()).padStart(2, '0')}:00`;
+}
+
+function drawChart() {
+  const canvas = $('usageChart');
+  const hint = $('usageChartHint');
+  if (!canvas || !chartSeries.length) return;
+
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = Math.max(280, canvas.clientWidth || canvas.parentElement?.clientWidth || 640);
+  const cssH = 168;
+  const pxW = Math.round(cssW * dpr);
+  const pxH = Math.round(cssH * dpr);
+  // 只在尺寸真的变了才重设：给 width 赋值会清空画布，hover 时不该走这条
+  if (canvas.width !== pxW || canvas.height !== pxH) {
+    canvas.width = pxW;
+    canvas.height = pxH;
+  }
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, cssW, cssH);
+
+  const padL = 10;
+  const padR = 10;
+  const padT = 18;
+  const padB = 22;
+  const w = cssW - padL - padR;
+  const h = cssH - padT - padB;
+  const slot = w / CHART_HOURS;
+  const barW = Math.max(2, slot * 0.28);
+  const font = '-apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif';
+
+  // 三条横向网格
+  ctx.strokeStyle = '#eef2f7';
+  ctx.lineWidth = 1;
+  for (let i = 1; i <= 3; i++) {
+    const y = padT + (h * i) / 4;
+    ctx.beginPath();
+    ctx.moveTo(padL, y);
+    ctx.lineTo(padL + w, y);
+    ctx.stroke();
+  }
+
+  const maxT = Math.max(1, ...chartSeries.map((s) => s.t));
+  const maxC = Math.max(1, ...chartSeries.map((s) => s.c));
+  const hasData = chartSeries.some((s) => s.t || s.c);
+
+  if (!hasData) {
+    ctx.fillStyle = '#94a3b8';
+    ctx.font = `12px ${font}`;
+    ctx.textAlign = 'center';
+    ctx.fillText('最近 24 小时还没有翻译记录', padL + w / 2, padT + h / 2);
+    if (hint) hint.textContent = '翻译任意页面后，这里会按小时显示消耗';
+    hideTip();
+    return;
+  }
+
+  // 悬停整列高亮：只改柱子颜色太细微，加一条竖向虚线一眼能看出选中哪一格
+  if (chartHover >= 0) {
+    const hx = padL + slot * chartHover;
+    ctx.fillStyle = 'rgba(37, 99, 235, 0.07)';
+    ctx.fillRect(hx, padT, slot, h);
+    ctx.strokeStyle = 'rgba(37, 99, 235, 0.3)';
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.moveTo(hx + slot / 2, padT);
+    ctx.lineTo(hx + slot / 2, padT + h);
+    ctx.stroke();
+    ctx.setLineDash([]);
+  }
+
+  chartSeries.forEach((s, i) => {
+    const cx = padL + slot * i + slot / 2;
+    const hovered = i === chartHover;
+    // token 与字符并排，各自按自身峰值缩放，只比形状不比高度
+    const th = (s.t / maxT) * h;
+    const ch = (s.c / maxC) * h;
+    if (s.t) {
+      ctx.fillStyle = hovered ? '#1d4ed8' : '#2563eb';
+      ctx.fillRect(cx - barW - 1, padT + h - th, barW, th);
+    }
+    if (s.c) {
+      ctx.fillStyle = hovered ? '#60a5fa' : '#93c5fd';
+      ctx.fillRect(cx + 1, padT + h - ch, barW, ch);
+    }
+  });
+
+  // 时间轴：首、每 6 小时、尾
+  ctx.fillStyle = '#94a3b8';
+  ctx.font = `10.5px ${font}`;
+  ctx.textAlign = 'center';
+  [0, 6, 12, 18, 23].forEach((i) => {
+    const x = padL + slot * i + slot / 2;
+    const clamped = Math.min(Math.max(x, padL + 16), padL + w - 16);
+    ctx.fillText(hourLabel(chartSeries[i].h), clamped, cssH - 6);
+  });
+
+  ctx.textAlign = 'left';
+  ctx.fillStyle = '#94a3b8';
+  ctx.fillText(`峰值 ${fmtShort(maxT)} tokens / ${fmtShort(maxC)} 字符`, padL, 12);
+
+  if (hint) {
+    if (chartHover >= 0) {
+      const s = chartSeries[chartHover];
+      hint.textContent = `${hourLabel(s.h)} 这一小时：${s.t.toLocaleString()} tokens · ${s.c.toLocaleString()} 字符`;
+    } else {
+      hint.textContent = '把鼠标移到柱子上查看该小时的具体数值';
+    }
+  }
+}
+
+function hideTip() {
+  const tip = $('usageChartTip');
+  if (tip) tip.hidden = true;
+}
+
+/** 跟随鼠标的数值浮层；i < 0 表示落在图外 */
+function updateTip(e, i) {
+  const tip = $('usageChartTip');
+  if (!tip) return;
+  const s = chartSeries[i];
+  if (i < 0 || !s) {
+    tip.hidden = true;
+    return;
+  }
+
+  tip.innerHTML =
+    `<div class="tip-head">${hourLabel(s.h)} – ${hourLabel(s.h + 1)}</div>` +
+    `<div class="tip-row"><span>Token</span><b>${s.t.toLocaleString()}</b></div>` +
+    `<div class="tip-row"><span>字符</span><b>${s.c.toLocaleString()}</b></div>`;
+
+  const block = tip.parentElement;
+  const br = block.getBoundingClientRect();
+  // 左右夹紧，避免浮层被卡片边缘裁掉；顶部留出自身高度，别翻到卡片外面
+  const x = Math.min(Math.max(e.clientX - br.left, 70), Math.max(70, br.width - 70));
+  const y = Math.max(e.clientY - br.top - 12, 64);
+  tip.style.left = `${x}px`;
+  tip.style.top = `${y}px`;
+  tip.hidden = false;
+}
+
+function bindChartEvents() {
+  const canvas = $('usageChart');
+  if (!canvas) return;
+
+  canvas.addEventListener('mousemove', (e) => {
+    const rect = canvas.getBoundingClientRect();
+    const padL = 10;
+    const padR = 10;
+    const slot = (rect.width - padL - padR) / CHART_HOURS;
+    const i = Math.floor((e.clientX - rect.left - padL) / slot);
+    const next = i >= 0 && i < CHART_HOURS ? i : -1;
+    if (next !== chartHover) {
+      chartHover = next;
+      drawChart();
+    }
+    // 同一列内移动也要跟着走，所以放在判断外面
+    updateTip(e, next);
+  });
+
+  canvas.addEventListener('mouseleave', () => {
+    if (chartHover !== -1) {
+      chartHover = -1;
+      drawChart();
+    }
+    hideTip();
+  });
+
+  window.addEventListener('resize', () => {
+    if (chartRaf) cancelAnimationFrame(chartRaf);
+    chartRaf = requestAnimationFrame(() => {
+      chartRaf = 0;
+      hideTip();
+      drawChart();
+    });
+  });
+}
+
+// 设置页开着时后台还在翻译：节流刷新，别每次请求都重绘
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'local' || (!changes.usage && !changes.usageHourly)) return;
+  clearTimeout(usageTimer);
+  usageTimer = setTimeout(loadUsage, 500);
+});
+
 $('resetUsage').addEventListener('click', async () => {
-  await chrome.storage.local.set({ usage: { requests: 0, chars: 0 } });
+  await chrome.storage.local.set({
+    usage: { requests: 0, chars: 0, tokens: 0 },
+    usageHourly: []
+  });
   await loadUsage();
 });
 
 load();
+bindChartEvents();
 loadUsage();

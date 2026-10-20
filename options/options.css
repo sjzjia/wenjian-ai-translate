@@ -207,6 +207,106 @@ textarea {
   border-top: 1px solid #f1f5f9;
 }
 
+/* 最近 24 小时用量波形图 */
+.chart-block {
+  position: relative;
+  margin-top: 4px;
+  padding-top: 14px;
+  border-top: 1px solid #f1f5f9;
+}
+
+.chart-tip {
+  position: absolute;
+  z-index: 10;
+  min-width: 108px;
+  padding: 6px 9px;
+  border-radius: 6px;
+  background: rgba(15, 23, 42, 0.92);
+  color: #f8fafc;
+  font-size: 11.5px;
+  line-height: 1.55;
+  white-space: nowrap;
+  pointer-events: none;
+  transform: translate(-50%, -100%);
+  box-shadow: 0 4px 14px rgba(15, 23, 42, 0.18);
+}
+
+.chart-tip[hidden] {
+  display: none;
+}
+
+.chart-tip .tip-head {
+  margin-bottom: 2px;
+  color: #cbd5e1;
+  font-size: 11px;
+}
+
+.chart-tip .tip-row {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.chart-tip .tip-row span {
+  color: #94a3b8;
+}
+
+.chart-tip .tip-row b {
+  font-weight: 600;
+}
+
+.chart-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.chart-title {
+  font-size: 13.5px;
+  font-weight: 550;
+}
+
+.chart-legend {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  font-size: 11.5px;
+  color: var(--muted);
+}
+
+.chart-legend .dot {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border-radius: 2px;
+  margin-right: 5px;
+  vertical-align: 1px;
+}
+
+.dot-token {
+  background: var(--blue);
+}
+
+.dot-char {
+  background: #93c5fd;
+}
+
+#usageChart {
+  display: block;
+  width: 100%;
+  height: 168px;
+}
+
+.chart-foot {
+  margin-top: 6px;
+  min-height: 16px;
+  font-size: 11.5px;
+  color: #94a3b8;
+}
+
 .switch-row:first-of-type {
   border-top: none;
 }

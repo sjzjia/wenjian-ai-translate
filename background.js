@@ -573,17 +573,48 @@ async function saveHistory(original, translated, lang) {
   }
 }
 
-/** 累计用量：请求次数与字符数，只存本地，用于估算消耗 */
-async function bumpUsage(chars) {
-  try {
-    const { usage } = await chrome.storage.local.get({ usage: { requests: 0, chars: 0 } });
-    usage.requests = (usage.requests || 0) + 1;
-    usage.chars = (usage.chars || 0) + chars;
-    usage.updatedAt = Date.now();
-    await chrome.storage.local.set({ usage });
-  } catch {
-    /* 统计失败不影响翻译 */
+/**
+ * 累计用量：请求次数、字符数、估算 token，只存本地。
+ * usageHourly 按整点分桶，保留最近 24 小时，供设置页画波形图。
+ */
+async function writeUsage(chars, tokens) {
+  const { usage, usageHourly } = await chrome.storage.local.get({
+    usage: { requests: 0, chars: 0, tokens: 0 },
+    usageHourly: []
+  });
+  usage.requests = (usage.requests || 0) + 1;
+  usage.chars = (usage.chars || 0) + chars;
+  usage.tokens = (usage.tokens || 0) + tokens;
+  usage.updatedAt = Date.now();
+
+  // 并发 12 时多个请求几乎同时回来，读-改-写必须串行（见下面的队列），
+  // 否则后写的会把先写的覆盖掉，小时桶也会丢
+  const nowHour = Math.floor(Date.now() / 3600000);
+  const buckets = Array.isArray(usageHourly)
+    ? usageHourly.filter((b) => b && typeof b.h === 'number' && b.h > nowHour - 24)
+    : [];
+  let bucket = buckets.find((b) => b.h === nowHour);
+  if (!bucket) {
+    bucket = { h: nowHour, c: 0, t: 0 };
+    buckets.push(bucket);
   }
+  bucket.c += chars;
+  bucket.t += tokens;
+  buckets.sort((a, b) => a.h - b.h);
+
+  await chrome.storage.local.set({ usage, usageHourly: buckets });
+}
+
+let usageQueue = Promise.resolve();
+
+/** 串行排队写入，避免并发请求互相覆盖统计 */
+function bumpUsage(chars, tokens = 0) {
+  const c = Math.max(0, Math.round(Number(chars) || 0));
+  const t = Math.max(0, Math.round(Number(tokens) || 0));
+  usageQueue = usageQueue.then(() => writeUsage(c, t)).catch(() => {
+    /* 统计失败不影响翻译 */
+  });
+  return usageQueue;
 }
 
 async function callChat(messages, opts = {}) {
@@ -650,12 +681,13 @@ async function callChat(messages, opts = {}) {
   }
 
   const data = await res.json();
-  // 只统计成功请求，失败重试不计入，避免用量虚高
-  bumpUsage(messages.reduce((s, m) => s + String(m.content || '').length, 0));
   const content = data?.choices?.[0]?.message?.content;
   if (typeof content !== 'string') {
     throw new Error('接口返回格式异常，未取到 choices[0].message.content');
   }
+  // 只统计成功请求，失败重试不计入，避免用量虚高
+  const inputText = messages.map((m) => String(m.content || '')).join('\n');
+  bumpUsage(inputText.length, roughTokens(inputText) + roughTokens(content));
   // 兜底清掉内联在正文里的思考内容（vLLM / SGLang 的 Qwen3 会这样）
   return stripThinking(content);
 }
@@ -846,6 +878,13 @@ async function streamChat(messages, onDelta) {
     let buf = '';
     let acc = '';
 
+    // 成功结束时统计一次：字符按消息长度，token 按输入 + 已收到的译文估。
+    // 返回 Promise，调用处 await，避免 Service Worker 在写入前被回收
+    const bumpStreamUsage = () => {
+      const inputText = messages.map((m) => String(m.content || '')).join('\n');
+      return bumpUsage(countChars(), roughTokens(inputText) + roughTokens(acc));
+    };
+
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
@@ -859,7 +898,7 @@ async function streamChat(messages, onDelta) {
         if (!line.startsWith('data:')) continue;
         const payload = line.slice(5).trim();
         if (payload === '[DONE]') {
-          bumpUsage(countChars());
+          await bumpStreamUsage();
           return stripThinking(acc);
         }
 
@@ -878,7 +917,7 @@ async function streamChat(messages, onDelta) {
         }
       }
     }
-    bumpUsage(countChars());
+    await bumpStreamUsage();
     return stripThinking(acc);
   } catch (e) {
     // 用户点「停止」：标记出来，上层直接收尾，不降级、不重发
@@ -1166,6 +1205,96 @@ function parseJsonObject(raw) {
 /* 对外能力                                                            */
 /* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ */
+/* token 估算                                                          */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 粗略 token 估算，只用于「大概多少」的预告，不追求与具体分词器一致。
+ * 中日韩：约 0.7 token/字（cl100k 实测 0.55~0.8）；其它语言：约 1 token/3.7 字符。
+ * 数字、标点偏保守地按英文算，宁可高估不低估。
+ */
+function roughTokens(text) {
+  const s = String(text || '');
+  let cjk = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (
+      (c >= 0x4e00 && c <= 0x9fff) || // 汉字
+      (c >= 0x3400 && c <= 0x4dbf) || // 扩展 A
+      (c >= 0x3040 && c <= 0x30ff) || // 日文假名
+      (c >= 0xac00 && c <= 0xd7af) // 韩文
+    ) {
+      cjk++;
+    }
+  }
+  return cjk * 0.7 + (s.length - cjk) / 3.7;
+}
+
+/**
+ * 翻译前的整页消耗估算。
+ * 分两个口径：
+ *   whole —— 整页原文全译一遍的量（不看缓存）
+ *   need  —— 实际这次要花的量（缓存命中的条目不产生请求，直接扣掉）
+ * 输入侧含每条约 1.5 token 的「编号|」开销和每批约 40 token 的 system；
+ * 输出侧按原文 token 的 1.2 倍估（中→英约 1.0，英→中约 1.3）。
+ */
+async function estimateTokens(texts, targetLang) {
+  if (!texts || !texts.length) {
+    return { ok: true, entries: 0, chars: 0, cached: 0, miss: 0, whole: 0, need: 0 };
+  }
+
+  const cfg = await getConfig();
+  const lang = targetLang || cfg.targetLang || '简体中文';
+  const model = cfg.model || '';
+  const sysPrompt = (cfg.systemPrompt || '').trim();
+  const keyOf = (t) =>
+    cacheKey(model, lang, t, `${sysPrompt}\u0000${glossaryForText(cfg.glossary, t)}`);
+
+  await loadCache();
+
+  let chars = 0;
+  let missChars = 0;
+  let cached = 0;
+  let miss = 0;
+  let allText = 0;
+  let missText = 0;
+
+  for (const t of texts) {
+    const s = String(t);
+    const tk = roughTokens(s);
+    chars += s.length;
+    allText += tk;
+    if (lookupTranslation(keyOf(s))) {
+      cached++;
+    } else {
+      miss++;
+      missChars += s.length;
+      missText += tk;
+    }
+  }
+
+  const pack = (textTokens, count, charCount) => {
+    // 批数按用户设置的单批字符数粗估；system 与编号都是小头
+    const perBatch = Math.max(300, Number(cfg.maxCharsPerBatch) || 2500);
+    const batches = Math.max(1, Math.ceil(charCount / perBatch));
+    const input = Math.ceil(textTokens + count * 1.5 + batches * 40);
+    const output = Math.ceil(textTokens * 1.2);
+    return input + output;
+  };
+
+  return {
+    ok: true,
+    entries: texts.length,
+    chars,
+    cached,
+    miss,
+    missChars,
+    whole: pack(allText, texts.length, chars),
+    need: pack(missText, miss, missChars)
+  };
+}
+
 /**
  * 批量翻译
  * @returns {{ok: boolean, translations?: string[], error?: string}}
@@ -1350,6 +1479,9 @@ async function testConnection(override) {
 
 async function handleMessage(msg, sender) {
   switch (msg && msg.type) {
+    case 'estimateTokens':
+      return estimateTokens(msg.texts || [], msg.targetLang);
+
     case 'translateBatch':
       return translateBatch(msg.texts || [], msg.targetLang);
 

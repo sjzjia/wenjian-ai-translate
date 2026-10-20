@@ -445,6 +445,24 @@
       return;
     }
 
+    // 整页 token 预估：只做提示，不阻塞翻译。
+    // 缓存命中的条目不会产生请求，所以「整页全译」和「本次实际」分开报
+    send({ type: 'estimateTokens', texts: [...groups.keys()], targetLang })
+      .then((est) => {
+        if (!est || !est.ok) return;
+        console.log(
+          `[LLMT] 整页估算：${est.entries} 条 / ${est.chars} 字 → ` +
+            `全译 ~${est.whole} tokens；缓存命中 ${est.cached} 条，本次实际 ~${est.need} tokens`
+        );
+        UI.flashToast(
+          `预计消耗 ~${est.need} tokens（整页全译 ~${est.whole}，缓存已覆盖 ${est.cached}/${est.entries} 条）`,
+          3000
+        );
+      })
+      .catch(() => {
+        /* 估算失败不影响翻译 */
+      });
+
     pending = prioritizeGroups(pending);
 
     const restChars = pending.reduce((s, g) => s + g.text.length, 0);

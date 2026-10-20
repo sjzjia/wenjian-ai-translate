@@ -222,6 +222,19 @@
           <button class="btn ghost" id="resetUsage" type="button">清零</button>
         </div>
 
+        <div class="chart-block">
+          <div class="chart-head">
+            <span class="chart-title">最近 24 小时消耗</span>
+            <span class="chart-legend">
+              <span><i class="dot dot-token"></i>Token</span>
+              <span><i class="dot dot-char"></i>字符</span>
+            </span>
+          </div>
+          <canvas id="usageChart" height="168"></canvas>
+          <div class="chart-tip" id="usageChartTip" hidden></div>
+          <div class="chart-foot" id="usageChartHint">加载中…</div>
+        </div>
+
         <div class="actions">
           <button class="btn ghost" id="clearCacheBtn" type="button">清除译文缓存</button>
           <button class="btn ghost" id="resetSkipBtn" type="button">恢复所有站点提示</button>
