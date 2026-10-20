@@ -206,10 +206,15 @@
     const targetLang = state.config.targetLang;
 
     // 三段耗时：收集 → 首条译文 → 全部完成。速度调优先看这三个数
+    // performance.now 与 Date.now 同时记：个别站点会覆写 performance.now
+    // （反检测脚本常把它固定成常量或大幅降低精度），污染的目的都是让
+    // 耗时看起来更短，所以取两个时钟里较大的那个更接近真实值
     const t0 = performance.now();
+    const t0Date = Date.now();
+    const since = () => Math.max(performance.now() - t0, Date.now() - t0Date);
     UI.flashToast('正在收集页面文本…', 4000);
     const items = await DOM.collect(document.body, targetLang);
-    const tCollect = performance.now() - t0;
+    const tCollect = since();
     if (!items.length) {
       UI.flashToast('没有找到可翻译的文本');
       return;
@@ -253,7 +258,9 @@
 
     const batches = DOM.batch(unique, {
       maxChars,
-      maxItems: 48,
+      // 64 条：字符上限 2500 装不满时，条数上限会成为批次数的主导因素
+      // （后台管理页 / 仪表盘大量 10~20 字短文本），64 行仍在模型稳定遵循范围内
+      maxItems: 64,
       firstMaxChars: firstChars
     });
 
@@ -299,7 +306,7 @@
           const item = b[index];
           if (!item || !text || !text.trim()) return;
           doneIdx.add(index);
-          if (!tFirst) tFirst = performance.now() - t0;
+          if (!tFirst) tFirst = since();
           if (applyTranslation(groups, item.text, text.trim())) applied++;
         };
 
@@ -361,7 +368,7 @@
     state.status = 'done';
     startFollow();
     if (state.records.length) {
-      const total = performance.now() - t0;
+      const total = since();
       const first = tFirst || total;
       // 控制台留一份完整数据：批次数、并发、三段耗时，排查慢在哪里直接看这里
       console.info(
@@ -509,7 +516,7 @@
       groups.get(key).push(it);
     }
     const unique = [...groups.entries()].map(([text, list]) => ({ text, list }));
-    const batches = DOM.batch(unique, { maxChars: 1500, maxItems: 24 });
+    const batches = DOM.batch(unique, { maxChars: 1500, maxItems: 32 });
 
     for (const b of batches) {
       if (state.status !== 'done') return;
@@ -1097,6 +1104,11 @@
     }
     step();
   }
+
+  // 注入时顺手唤醒 Service Worker：冷启动要几十到上百毫秒，
+  // 用户点翻译时若正好撞上冷启动，第一条请求就白等这段时间。
+  // SW 已在运行时这条消息几乎是零成本；chrome:// 等页面发不出去，失败无害
+  chrome.runtime.sendMessage({ type: 'ping' }).catch(() => {});
 
   loadConfig().then(scheduleSuggestCheck);
 })();

@@ -409,26 +409,61 @@ async function callChat(messages, opts = {}) {
  * haystack 为本批待译文本：只保留在其中出现过的术语，
  * 否则动辄上百条的术语表会在每个批次里重复发送，白白消耗 token。
  */
-function glossaryBlock(glossary, haystack) {
+const GLOSSARY_HEAD = '术语表（出现时严格按下列译法，不得改写）：';
+
+/** 术语表条目缓存：整份术语表对每条待译文本都要重新 split 一次是白做工 */
+let glossaryLinesCache = { raw: '', lines: [] };
+function glossaryLines(glossary) {
   const raw = String(glossary || '').trim();
-  if (!raw) return '';
-  const lines = raw
-    .split(/\r?\n/)
-    .map((s) => s.trim())
-    .filter((s) => s && /[=＝]/.test(s))
-    .slice(0, 300);
+  if (glossaryLinesCache.raw !== raw) {
+    glossaryLinesCache = {
+      raw,
+      lines: raw
+        .split(/\r?\n/)
+        .map((s) => s.trim())
+        .filter((s) => s && /[=＝]/.test(s))
+        .slice(0, 300)
+    };
+  }
+  return glossaryLinesCache.lines;
+}
+
+/** 术语表里命中这段文本的条目 */
+function glossaryUsed(glossary, text) {
+  const lines = glossaryLines(glossary);
+  if (!lines.length || !text) return [];
+  // 整段只小写化一次：放在 filter 里会对 300 条术语各做一次全量拷贝
+  const lower = text.toLowerCase();
+  return lines.filter((l) => {
+    const src = l.split(/[=＝]/)[0].trim();
+    // 大小写不敏感匹配：术语表写 Transformer，正文里出现 transformer 也要命中
+    return src && lower.includes(src.toLowerCase());
+  });
+}
+
+function glossaryBlock(glossary, haystack) {
+  const lines = glossaryLines(glossary);
   if (!lines.length) return '';
-  // haystack 整批只小写化一次：放在 filter 里会对 300 条术语各做一次全量拷贝
   const lowerHay = haystack ? haystack.toLowerCase() : '';
   const used = haystack
     ? lines.filter((l) => {
         const src = l.split(/[=＝]/)[0].trim();
-        // 大小写不敏感匹配：术语表写 Transformer，正文里出现 transformer 也要命中
         return src && lowerHay.includes(src.toLowerCase());
       })
     : lines;
   if (!used.length) return '';
-  return `术语表（出现时严格按下列译法，不得改写）：\n${used.join('\n')}`;
+  return `${GLOSSARY_HEAD}\n${used.join('\n')}`;
+}
+
+/**
+ * 单段文本实际命中的术语块，专用于缓存键。
+ * 键里带全量术语表时，改一条与本文无关的术语就会让整站缓存失效、
+ * 触发全量重译（一次就是几万 token）；按命中条目构造键后，
+ * 同一文本无论落到哪个批次、术语表怎么改，只要作用于它的条目没变，键就稳定。
+ */
+function glossaryForText(glossary, text) {
+  const used = glossaryUsed(glossary, text);
+  return used.length ? `${GLOSSARY_HEAD}\n${used.join('\n')}` : '';
 }
 
 function buildStreamSystemPrompt(targetLang, custom, glossary, haystack) {
@@ -685,9 +720,12 @@ async function translateBatchStream(texts, targetLang, push) {
   const cfg = await getConfig();
   const lang = targetLang || cfg.targetLang || '简体中文';
   const model = cfg.model || '';
-  // 提示词和术语表都会改变译文，必须一起进缓存键，否则改了配置还命中旧译文
-  const style = `${(cfg.systemPrompt || '').trim()}\u0000${(cfg.glossary || '').trim()}`;
-  const keyOf = (t) => cacheKey(model, lang, t, style);
+  // 提示词和术语表都会改变译文，必须一起进缓存键，否则改了配置还命中旧译文。
+  // 术语表只带「该文本命中的条目」：改一条无关术语不会再让整站缓存失效、
+  // 触发全量重译（一次重译就是几万 token）
+  const sysPrompt = (cfg.systemPrompt || '').trim();
+  const keyOf = (t) =>
+    cacheKey(model, lang, t, `${sysPrompt}\u0000${glossaryForText(cfg.glossary, t)}`);
 
   await loadCache();
 
@@ -816,10 +854,12 @@ async function translateBatch(texts, targetLang) {
   const cfg = await getConfig();
   const lang = targetLang || cfg.targetLang || '简体中文';
   const model = cfg.model || '';
-  // 自定义提示词会改变译文风格，必须参与缓存键，否则改完设置仍命中旧译文
-  // 提示词和术语表都会改变译文，必须一起进缓存键，否则改了配置还命中旧译文
-  const style = `${(cfg.systemPrompt || '').trim()}\u0000${(cfg.glossary || '').trim()}`;
-  const keyOf = (t) => cacheKey(model, lang, t, style);
+  // 自定义提示词会改变译文风格，必须参与缓存键，否则改完设置仍命中旧译文。
+  // 术语表只带「该文本命中的条目」：改一条无关术语不会再让整站缓存失效、
+  // 触发全量重译（一次重译就是几万 token）
+  const sysPrompt = (cfg.systemPrompt || '').trim();
+  const keyOf = (t) =>
+    cacheKey(model, lang, t, `${sysPrompt}\u0000${glossaryForText(cfg.glossary, t)}`);
 
   await loadCache();
 
@@ -1018,6 +1058,12 @@ async function handleMessage(msg, sender) {
 
     case 'clearHistory':
       await chrome.storage.local.set({ history: [] });
+      return { ok: true };
+
+    case 'ping':
+      // 预热：content script 注入时就把 Service Worker 唤醒、缓存预载进内存，
+      // 用户点翻译时不必等冷启动和首轮读盘
+      await loadCache();
       return { ok: true };
 
     case 'testConnection':
