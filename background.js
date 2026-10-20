@@ -11,7 +11,7 @@ const DEFAULTS = {
   targetLang: '简体中文',
   temperature: 0.3,
   maxCharsPerBatch: 2500,
-  concurrency: 6,
+  concurrency: 12,
   bilingual: false,
   autoTranslateSelection: false,
   autoPrompt: true,
@@ -157,6 +157,21 @@ async function clearCache() {
 
 const REQUEST_TIMEOUT_MS = 60000;
 const MAX_RETRIES = 2;
+
+/**
+ * 按请求体量估算超时。固定 60 / 120 秒对慢模型是灾难：
+ * 一批 2500 字要输出约 3000 token，30 tok/s 就得 100 秒，
+ * 固定上限会稳定超时，然后降级非流式（60 秒，更容易死）、拆批、再超时。
+ * 这里按 15 token/s 保守估计生成耗时，另加 20 秒预填充与网络余量。
+ * 本地 4B 模型实测远快于此，给宽一点不会拖慢它——超时只在真的卡住时才触发。
+ */
+function timeoutFor(body) {
+  const chars = (body && body.messages ? body.messages : []).reduce(
+    (s, m) => s + String(m.content || '').length,
+    0
+  );
+  return Math.max(REQUEST_TIMEOUT_MS, Math.min(300000, 20000 + chars * 80));
+}
 // 临时性故障，退避重试往往能成功
 const RETRYABLE_STATUS = new Set([408, 409, 425, 429, 500, 502, 503, 504]);
 
@@ -329,7 +344,7 @@ function outputLimitKey(baseUrl, model) {
 /** 单次请求，带超时。超时抛 AbortError，由上层翻译成可读文案 */
 async function postChat(baseUrl, apiKey, body) {
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), REQUEST_TIMEOUT_MS);
+  const timer = setTimeout(() => ctrl.abort(), timeoutFor(body));
   try {
     // 本地模型没有 Key 时不发送 Authorization，避免服务端拒绝空凭证
     const headers = { 'Content-Type': 'application/json' };
@@ -351,6 +366,13 @@ async function postChat(baseUrl, apiKey, body) {
  */
 let rateLimitUntil = 0;
 
+/**
+ * 正在进行的流式请求。用户点「停止」时只丢掉前端结果的话，
+ * 后台会把整批译完再丢弃，token 照付（大模型一批上千 token）。
+ * 这里留着 controller，收到取消消息就真正 abort。
+ */
+const activeStreamCtrls = new Set();
+
 /** 带退避重试的请求：429 / 5xx 等临时错误重试，其余立即返回 */
 async function requestChat(baseUrl, apiKey, body) {
   let last = null;
@@ -361,7 +383,8 @@ async function requestChat(baseUrl, apiKey, body) {
       last = await postChat(baseUrl, apiKey, body);
     } catch (e) {
       if (e && e.name === 'AbortError') {
-        throw new Error(`请求超时（${REQUEST_TIMEOUT_MS / 1000} 秒无响应），请检查接口地址或网络`);
+        const sec = Math.round(timeoutFor(body) / 1000);
+        throw new Error(`请求超时（${sec} 秒无响应），请检查接口地址或网络`);
       }
       throw new Error(`网络请求失败：${e.message}（请检查接口地址是否可访问）`);
     }
@@ -630,7 +653,10 @@ async function streamChat(messages, onDelta) {
   if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
 
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), 120000);
+  activeStreamCtrls.add(ctrl);
+  // 与非流式同一套估算：慢模型生成一批 2500 字可能要 100 秒以上，
+  // 原来固定 120 秒会卡在临界点上，忽快忽慢时随机失败
+  const timer = setTimeout(() => ctrl.abort(), timeoutFor(body));
   // 与非流式保持一致：成功结束后统计一次用量
   const countChars = () => messages.reduce((s, m) => s + String(m.content || '').length, 0);
   try {
@@ -704,7 +730,16 @@ async function streamChat(messages, onDelta) {
     }
     bumpUsage(countChars());
     return stripThinking(acc);
+  } catch (e) {
+    // 用户点「停止」：标记出来，上层直接收尾，不降级、不重发
+    if (e && e.name === 'AbortError' && ctrl.userCancelled) {
+      const err = new Error('已取消');
+      err.cancelled = true;
+      throw err;
+    }
+    throw e;
   } finally {
+    activeStreamCtrls.delete(ctrl);
     clearTimeout(timer);
   }
 }
@@ -881,6 +916,11 @@ async function translateBatchStream(texts, targetLang, push) {
         push(idx, text);
       });
     } catch (e) {
+      // 用户点了停止：直接收尾，既不降级也不重发，省掉一次整批请求
+      if (e && e.cancelled) {
+        flushCache(); // 已经收到的译文仍要落盘，下次不用重译
+        return { ok: false, cancelled: true };
+      }
       // 流式不可用（接口不支持 / 网络中断）交给调用方降级为非流式重发；
       // 但鉴权、地址、限流类错误换个姿势重发也必然失败，
       // 直接抛出，省掉整批一次注定失败的重复请求（并发 6 时就是 6 次）
@@ -1131,8 +1171,8 @@ async function translateIndividually(texts, lang, cfg) {
     }
   };
 
-  // 并发跟设置走：慢接口下调低并发可避免互相排队，快接口可到 8
-  const parallel = Math.max(1, Math.min(Number(conf.concurrency) || 5, 8));
+  // 并发跟设置走：逐条兜底只在批量路径彻底失败时才走，这里不必再压得比主路径低
+  const parallel = Math.max(1, Math.min(Number(conf.concurrency) || 8, 16));
   await Promise.all(Array.from({ length: Math.min(parallel, texts.length) }, worker));
   return out;
 }
@@ -1191,6 +1231,16 @@ async function handleMessage(msg, sender) {
         });
 
       return { ok: true, accepted: true };
+    }
+
+    case 'cancelStreams': {
+      // 真正中止在途请求：不中止的话模型会一直生成到结束，token 照付
+      for (const c of activeStreamCtrls) {
+        c.userCancelled = true;
+        c.abort();
+      }
+      activeStreamCtrls.clear();
+      return { ok: true };
     }
 
     case 'translateText': {

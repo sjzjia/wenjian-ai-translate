@@ -5,7 +5,7 @@ const DEFAULTS = {
   targetLang: '简体中文',
   temperature: 0.3,
   maxCharsPerBatch: 2500,
-  concurrency: 6,
+  concurrency: 12,
   bilingual: false,
   autoTranslateSelection: false,
   autoPrompt: true,

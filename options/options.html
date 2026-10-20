@@ -108,8 +108,8 @@
 
           <div class="field">
             <label for="concurrency">并发请求数</label>
-            <input id="concurrency" type="number" min="1" max="10" step="1" />
-            <span class="tip">同时发出的批次数。远端接口（API）默认 6、可到 10；本地模型自动降为 2（服务端串行，调高只会排队），填 7 以上可强制调高。翻译时进度提示会显示当前并发数。</span>
+            <input id="concurrency" type="number" min="1" max="32" step="1" />
+            <span class="tip">同时发出的批次数，是总耗时的主要杠杆（总时间 ≈ 单批耗时）。远端 API 默认 12、上限 32；大模型生成慢，建议 16~24。本地模型自动降为 2（服务端串行，调高只会排队）。撞 429 会自动全局退避，不会放大请求。</span>
           </div>
         </div>
 

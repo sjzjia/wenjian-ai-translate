@@ -13,7 +13,7 @@
     targetLang: '简体中文',
     bilingual: false,
     baseUrl: 'https://api.openai.com/v1',
-    concurrency: 6,
+    concurrency: 12,
     autoTranslateSelection: false,
     maxCharsPerBatch: 2500,
     autoPrompt: true,
@@ -127,6 +127,9 @@
    * （最长 180 秒），界面就卡在「翻译中」。
    */
   function cancelPendingStreams() {
+    // 通知后台真正中止正在生成的请求。原来只丢弃前端结果，
+    // 后台仍会把整批译完，token 照付——大模型一批就是上千 token
+    send({ type: 'cancelStreams' }).catch(() => {});
     for (const [id, w] of streamWaiters) {
       clearTimeout(w.timer);
       try {
@@ -234,22 +237,26 @@
     }
     const unique = [...groups.entries()].map(([text, list]) => ({ text, list }));
 
-    // 并发策略：远端接口（HTTPS / HTTP2）是真并行，默认 6、上限 10；
+    // 并发策略：远端接口（HTTPS / HTTP2）是真并行，默认 12、上限 32；
     // 本地推理服务端默认串行，默认自动降到 2、上限 6（HTTP/1.1 单主机连接数）。
-    // 6 是历史默认值，本地端点下视为「没手动调过」才降档；填 7 以上可强制调高
+    // 6 是历史默认值，视为「没手动调过」才套用新默认；手动填其它值以用户为准。
+    // 大模型生成慢，总耗时 ≈ 单批耗时 ≈ 总输出/(并发×单流速度)，并发是唯一线性杠杆
     const local = isLocalBaseUrl(state.config.baseUrl);
     const stored = Number(state.config.concurrency);
-    const wanted = stored && stored !== 6 ? stored : local ? 2 : 6;
+    const wanted = stored && stored !== 6 ? stored : local ? 2 : 12;
     // 切批时要保证批次数够喂满 worker，否则小页面会有 worker 空转
-    const concurrency = Math.max(1, Math.min(wanted, local ? 6 : 10));
+    const concurrency = Math.max(1, Math.min(wanted, local ? 6 : 32));
 
     const userMax = Number(state.config.maxCharsPerBatch) || 2500;
     const totalChars = unique.reduce((s, it) => s + it.text.trim().length, 0);
 
     // 首批只放一小撮，页面顶部先出译文；剩下的文本由其余 worker 均分，
     // 批次数仍然正好一轮跑完，不会因为首批变小而多出一轮。
+    // 远端慢模型首字延迟高，首批再切小些：首条译文 = TTFT + 这一小撮的生成时间
     const firstChars =
-      concurrency > 1 ? Math.min(200, Math.floor(totalChars / concurrency / 2)) : 0;
+      concurrency > 1
+        ? Math.min(local ? 200 : 120, Math.floor(totalChars / concurrency / 2))
+        : 0;
     const restChars = Math.max(0, totalChars - firstChars);
     // 留 10% 余量：首批实际装不满预估字符数，不留余量会多切出一批尾巴
     const autoMax =
