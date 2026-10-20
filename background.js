@@ -21,7 +21,8 @@ const DEFAULTS = {
   autoFollow: true,
   skipSites: [],
   systemPrompt: '',
-  glossary: ''
+  glossary: '',
+  compactPrompt: true
 };
 
 /* 配置缓存：避免每个批次都读一次 storage.sync */
@@ -40,12 +41,19 @@ chrome.storage.onChanged.addListener((changes, area) => {
 
 /* ------------------------------------------------------------------ */
 /* 译文缓存：相同文本 + 相同目标语言 + 相同模型直接命中                  */
-/* 一级内存缓存，二级 storage.local 持久化（Service Worker 重启不丢）    */
+/* 一级内存 Map，二级 IndexedDB。                                       */
+/* 用 IDB 而不是 storage.local：后者只有 5MB，两千条左右就写满，        */
+/* 被淘汰的恰好是导航、页脚、表头这类跨页面反复出现的热文本，           */
+/* 掉一条就是整批重译一次。                                            */
 /* ------------------------------------------------------------------ */
 
-const CACHE_PREFIX = 'tc:';
-const CACHE_LIMIT = 2000;
+const CACHE_PREFIX = 'tc:';        // 缓存键前缀；也用于识别 storage.local 里的旧缓存
+const CACHE_LIMIT = 20000;         // IDB 容量够用，按条数控制内存占用即可
+const DB_NAME = 'llmt-cache';
+const DB_STORE = 'kv';
+const DB_VERSION = 1;
 
+/** key -> { v: 译文, t: 最近使用时间 }：时间戳一起落盘，重启后仍是真 LRU */
 const memCache = new Map();
 let cachePromise = null;
 let cacheDirty = new Set();
@@ -66,47 +74,166 @@ function cacheKey(model, lang, text, style) {
   return CACHE_PREFIX + hashStr(s) + hashStr(s + '\u0001');
 }
 
+/* ---------------- IndexedDB 存取 ---------------- */
+
+let dbPromise = null;
+let dbBroken = false;   // 隐私模式 / 存储被禁用：退回纯内存，不再反复重试
+
+function openDb() {
+  if (dbBroken) return Promise.reject(new Error('IndexedDB 不可用'));
+  if (dbPromise) return dbPromise;
+  dbPromise = new Promise((resolve, reject) => {
+    let req;
+    try {
+      req = indexedDB.open(DB_NAME, DB_VERSION);
+    } catch (e) {
+      reject(e);
+      return;
+    }
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(DB_STORE)) db.createObjectStore(DB_STORE);
+    };
+    req.onsuccess = () => {
+      const db = req.result;
+      // 版本升级或存储被清空后句柄会失效，让下一次操作重新打开
+      db.onversionchange = () => {
+        db.close();
+        dbPromise = null;
+      };
+      resolve(db);
+    };
+    req.onerror = () => reject(req.error || new Error('IndexedDB 打开失败'));
+    req.onblocked = () => reject(new Error('IndexedDB 被占用'));
+  }).catch((e) => {
+    dbBroken = true;
+    dbPromise = null;
+    throw e;
+  });
+  return dbPromise;
+}
+
+/** 在一个事务里跑完同步操作，按事务成败 resolve / reject */
+function idbRun(mode, fn) {
+  return openDb().then(
+    (db) =>
+      new Promise((resolve, reject) => {
+        const tx = db.transaction(DB_STORE, mode);
+        fn(tx.objectStore(DB_STORE));
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+        tx.onabort = () => reject(tx.error);
+      })
+  );
+}
+
+/** 读出全部缓存，返回 [[key, 译文, 最近使用时间]] */
+function idbLoadAll() {
+  return openDb().then(
+    (db) =>
+      new Promise((resolve, reject) => {
+        const tx = db.transaction(DB_STORE, 'readonly');
+        const store = tx.objectStore(DB_STORE);
+        // 两个请求同一事务、同一键序，下标一一对应
+        const vals = store.getAll();
+        const keys = store.getAllKeys();
+        tx.oncomplete = () => {
+          const out = [];
+          const vs = vals.result || [];
+          const ks = keys.result || [];
+          for (let i = 0; i < ks.length; i++) {
+            const e = vs[i];
+            if (e && typeof e.v === 'string' && e.v) out.push([ks[i], e.v, e.t || 0]);
+          }
+          resolve(out);
+        };
+        tx.onerror = () => reject(tx.error);
+        tx.onabort = () => reject(tx.error);
+      })
+  );
+}
+
+const idbPut = (rows) =>
+  idbRun('readwrite', (store) => {
+    for (const [k, v, t] of rows) store.put({ v, t }, k);
+  });
+
+const idbDelete = (keys) =>
+  idbRun('readwrite', (store) => {
+    for (const k of keys) store.delete(k);
+  });
+
+const idbClear = () => idbRun('readwrite', (store) => store.clear());
+
+/* ---------------- 缓存读写 ---------------- */
+
+/**
+ * 首次加载：IDB 里的缓存读进内存，按最近使用时间升序放回 Map。
+ * 时间戳一起持久化，Service Worker 重启后队列顺序仍是真实的 LRU 顺序；
+ * 以前 storage.local 返回的键序是任意的，重启一次淘汰的就可能是热文本。
+ */
 function loadCache() {
   if (!cachePromise) {
     cachePromise = (async () => {
+      let rows;
       try {
-        const all = await chrome.storage.local.get(null);
-        for (const [k, v] of Object.entries(all)) {
-          if (k.startsWith(CACHE_PREFIX) && typeof v === 'string' && v) {
-            memCache.set(k, v);
-          }
-        }
+        rows = await idbLoadAll();
       } catch {
-        /* 缓存不可用不影响主流程 */
+        return; // IDB 不可用：纯内存运行，重启后缓存清零，不影响翻译
       }
+      if (!rows.length) rows = await importLegacyCache();
+      if (!rows.length) return;
+      rows.sort((a, b) => a[2] - b[2]);
+      const dropCount = Math.max(0, rows.length - CACHE_LIMIT);
+      if (dropCount) idbDelete(rows.slice(0, dropCount).map((r) => r[0])).catch(() => {});
+      for (const [k, v, t] of rows.slice(dropCount)) memCache.set(k, { v, t });
     })();
   }
   return cachePromise;
 }
 
+/** 搬迁老版本存在 storage.local 里的译文缓存（键格式没变，搬完即可命中） */
+async function importLegacyCache() {
+  try {
+    const all = await chrome.storage.local.get(null);
+    const rows = [];
+    for (const [k, v] of Object.entries(all)) {
+      if (k.startsWith(CACHE_PREFIX) && typeof v === 'string' && v) {
+        rows.push([k, v, Date.now()]);
+      }
+    }
+    if (!rows.length) return [];
+    await idbPut(rows);
+    await chrome.storage.local.remove(rows.map((r) => r[0]));
+    return rows;
+  } catch {
+    return [];
+  }
+}
+
 /**
  * 读缓存并刷新 LRU 顺序。
- * 淘汰按 Map 插入顺序丢最早写入的条目，命中时挪到队尾，
+ * 淘汰按 Map 插入顺序丢最久未用的条目，命中时挪到队尾，
  * 导航 / 页脚这类跨页面重复的热文本就不会被一次性长页挤出去。
  */
 function lookupTranslation(key) {
-  const v = memCache.get(key);
-  if (v) {
-    memCache.delete(key);
-    memCache.set(key, v);
-  }
-  return v;
+  const e = memCache.get(key);
+  if (!e) return '';
+  memCache.delete(key);
+  e.t = Date.now();
+  memCache.set(key, e);
+  return e.v;
 }
 
 function rememberTranslation(key, value) {
   if (!value) return;
-  memCache.set(key, value);
+  memCache.set(key, { v: value, t: Date.now() });
   cacheDirty.add(key);
-  // 简单容量控制：超限时丢弃最早写入的条目
+  // 容量控制：超限时丢弃最久未用的条目
   if (memCache.size > CACHE_LIMIT) {
     const drop = [...memCache.keys()].slice(0, memCache.size - CACHE_LIMIT);
     for (const k of drop) memCache.delete(k);
-    chrome.storage.local.remove(drop).catch(() => {});
+    idbDelete(drop).catch(() => {});
   }
 }
 
@@ -123,15 +250,13 @@ function flushCache() {
 
 function flushCacheNow() {
   if (!cacheDirty.size) return;
-  const patch = {};
+  const rows = [];
   for (const k of cacheDirty) {
-    const v = memCache.get(k);
-    if (v) patch[k] = v;
+    const e = memCache.get(k);
+    if (e) rows.push([k, e.v, e.t]);
   }
   cacheDirty.clear();
-  if (Object.keys(patch).length) {
-    chrome.storage.local.set(patch).catch(() => {});
-  }
+  if (rows.length) idbPut(rows).catch(() => {});
 }
 
 async function clearCache() {
@@ -142,6 +267,12 @@ async function clearCache() {
   memCache.clear();
   cacheDirty.clear();
   cachePromise = null;
+  try {
+    await idbClear();
+  } catch {
+    /* IDB 不可用时没有落盘缓存可清 */
+  }
+  // 老版本遗留的 storage.local 缓存一并清掉
   try {
     const all = await chrome.storage.local.get(null);
     const keys = Object.keys(all).filter((k) => k.startsWith(CACHE_PREFIX));
@@ -596,17 +727,36 @@ function glossaryForText(glossary, text) {
   return used.length ? `${GLOSSARY_HEAD}\n${used.join('\n')}` : '';
 }
 
-function buildStreamSystemPrompt(targetLang, custom, glossary, haystack) {
-  const g = glossaryBlock(glossary, haystack);
-  const tail = g ? `\n${g}` : '';
+/**
+ * system 消息只放「跨批次不变」的指令，术语表一律走用户消息。
+ * 各家的前缀缓存（DeepSeek / OpenAI / vLLM / SGLang）按最长公共前缀命中，
+ * 以前术语表拼在 system 末尾，每批内容不同，缓存整段失效；
+ * 现在同一目标语言 + 同一自定义提示词下 system 逐字相同，可稳定命中。
+ */
+function buildStreamSystemPrompt(targetLang, custom, compact) {
   if (custom && custom.trim()) {
     const c = custom.replace(/\{lang\}/g, targetLang);
     // 自定义提示词没写 {lang} 时补一句，否则模型不知道要译成什么语言
     const withLang = /\{lang\}/.test(custom) ? c : `${c}\n目标语言：${targetLang}`;
     // 自定义提示词可能要求输出 JSON 数组，流式下无法逐条解析，追加行格式约束
-    return `${withLang}\n每行按「编号|译文」输出，不要数组和代码块。${tail}`;
+    return `${withLang}\n每行按「编号|译文」输出，不要数组和代码块。`;
   }
-  return `把每行「编号|原文」译成「${targetLang}」，按「编号|译文」逐行输出，不遗漏，保留数字/链接/代码/专有名词，不要数组和代码块。${tail}`;
+  if (compact) {
+    // 极简版：约束一条不少，字符少三成，每批省下的量乘以批次数
+    return `逐行译成「${targetLang}」，输出「编号|译文」，不漏行，保留数字/链接/代码/专名，不用数组或代码块。`;
+  }
+  return `把每行「编号|原文」译成「${targetLang}」，按「编号|译文」逐行输出，不遗漏，保留数字/链接/代码/专有名词，不要数组和代码块。`;
+}
+
+/**
+ * 用户消息 = 命中的术语表 + 本批「编号|原文」行。
+ * 术语表放在正文之前：既符合「先规则后内容」的阅读顺序，
+ * 也避免模型把紧跟在正文后面的术语表当成待续写内容回显出来。
+ */
+function buildUserPrompt(texts, glossary) {
+  const body = buildBatchPrompt(texts);
+  const g = glossaryBlock(glossary, body);
+  return g ? `${g}\n\n${body}` : body;
 }
 
 /**
@@ -820,9 +970,9 @@ function parseStreamEntry(line) {
  * 返回已解析到的条目数。
  */
 async function translateStreamCore(texts, lang, cfg, onEntry) {
-  const user = buildBatchPrompt(texts);
-  // 术语表按本批文本过滤，避免每个批次重复发送整份术语表
-  const sys = buildStreamSystemPrompt(lang, cfg.systemPrompt, cfg.glossary, user);
+  // 术语表按本批文本过滤后拼进用户消息，system 保持逐字稳定以命中前缀缓存
+  const user = buildUserPrompt(texts, cfg.glossary);
+  const sys = buildStreamSystemPrompt(lang, cfg.systemPrompt, cfg.compactPrompt !== false);
 
   let buf = '';
   let parsed = 0;
@@ -961,17 +1111,18 @@ async function translateBatchStream(texts, targetLang, push) {
 /* 提示词与解析                                                        */
 /* ------------------------------------------------------------------ */
 
-function buildSystemPrompt(targetLang, custom, glossary, haystack) {
-  const g = glossaryBlock(glossary, haystack);
-  const tail = g ? `\n${g}` : '';
+/** 非流式路径的 system：同样只放跨批次不变的指令，术语表交给 buildUserPrompt */
+function buildSystemPrompt(targetLang, custom, compact) {
   if (custom && custom.trim()) {
     const c = custom.replace(/\{lang\}/g, targetLang);
     // 自定义提示词没写 {lang} 时补一句，否则模型不知道要译成什么语言
-    const base = /\{lang\}/.test(custom) ? c : `${c}\n目标语言：${targetLang}`;
-    return base + tail;
+    return /\{lang\}/.test(custom) ? c : `${c}\n目标语言：${targetLang}`;
   }
   // 一行一条：比 <seg> 包装和 JSON 键值省一半以上 token
-  return `把每行「编号|原文」译成「${targetLang}」，输出「编号|译文」，逐行对应不遗漏，保留数字/链接/代码/专有名词，不要解释。${tail}`;
+  if (compact) {
+    return `逐行译成「${targetLang}」，输出「编号|译文」，不漏行，保留数字/链接/代码/专名，不用解释。`;
+  }
+  return `把每行「编号|原文」译成「${targetLang}」，输出「编号|译文」，逐行对应不遗漏，保留数字/链接/代码/专有名词，不要解释。`;
 }
 
 // 编号|原文，一行一条；连续空白压成单个空格、去掉首尾空白，
@@ -1067,13 +1218,13 @@ async function translateBatch(texts, targetLang) {
 
 /** 实际发起请求的批量翻译（不含缓存逻辑） */
 async function translateCore(texts, lang, cfg) {
-  // 术语表按本批文本过滤，避免每个批次重复发送整份术语表
-  const sys = buildSystemPrompt(lang, cfg.systemPrompt, cfg.glossary, texts.join('\n'));
+  // 术语表按本批文本过滤后拼进用户消息，system 保持逐字稳定以命中前缀缓存
+  const sys = buildSystemPrompt(lang, cfg.systemPrompt, cfg.compactPrompt !== false);
 
   try {
     const raw = await callChat([
       { role: 'system', content: sys },
-      { role: 'user', content: buildBatchPrompt(texts) }
+      { role: 'user', content: buildUserPrompt(texts, cfg.glossary) }
     ]);
 
     const obj = parseNumberedBlock(raw) || parseJsonObject(raw);

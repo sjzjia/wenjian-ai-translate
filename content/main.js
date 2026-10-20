@@ -27,6 +27,7 @@
     status: 'idle', // idle | translating | done
     records: [],
     cancel: false,
+    runId: 0, // 每轮全页翻译一个代号，停止后立刻重开时用来淘汰上一轮的 worker
     config: { ...DEFAULTS }
   };
 
@@ -217,61 +218,113 @@
     const t0 = performance.now();
     const t0Date = Date.now();
     const since = () => Math.max(performance.now() - t0, Date.now() - t0Date);
-    UI.flashToast('正在收集页面文本…', 4000);
-    const items = await DOM.collect(document.body, targetLang);
-    const tCollect = since();
-    if (!items.length) {
-      UI.flashToast('没有找到可翻译的文本');
-      return;
-    }
-
-    // 视口内的段落排到前面，用户正在看的部分先出译文
-    DOM.prioritizeInView(items);
-
-    // 相同文本去重，减少请求量
-    const groups = new Map();
-    for (const it of items) {
-      const key = it.text.trim();
-      if (!groups.has(key)) groups.set(key, []);
-      groups.get(key).push(it);
-    }
-    const unique = [...groups.entries()].map(([text, list]) => ({ text, list }));
 
     // 并发策略：远端接口（HTTPS / HTTP2）是真并行，默认 12、上限 32；
     // 本地推理服务端默认串行，默认自动降到 2、上限 6（HTTP/1.1 单主机连接数）。
     // 6 是历史默认值，视为「没手动调过」才套用新默认；手动填其它值以用户为准。
-    // 大模型生成慢，总耗时 ≈ 单批耗时 ≈ 总输出/(并发×单流速度)，并发是唯一线性杠杆
+    // 大模型生成慢，总耗时 ≈ 总输出/(并发×单流速度)，并发是唯一线性杠杆
     const local = isLocalBaseUrl(state.config.baseUrl);
     const stored = Number(state.config.concurrency);
     const wanted = stored && stored !== 6 ? stored : local ? 2 : 12;
-    // 切批时要保证批次数够喂满 worker，否则小页面会有 worker 空转
     const concurrency = Math.max(1, Math.min(wanted, local ? 6 : 32));
 
     const userMax = Number(state.config.maxCharsPerBatch) || 2500;
-    const totalChars = unique.reduce((s, it) => s + it.text.trim().length, 0);
+    // 单批字符硬上限：请求层按 estChars×2+300 估 max_tokens（封顶 8192），
+    // 6000 字符原文的译文仍在这个预算内，再大就会被拦腰截断。
+    // 本地推理服务端串行、prefill 慢，放大批次只会拖慢单批，所以本地不放大
+    const MAX_BATCH_CHARS = local ? Math.max(300, userMax) : 6000;
 
-    // 首批只放一小撮，页面顶部先出译文；剩下的文本由其余 worker 均分，
-    // 批次数仍然正好一轮跑完，不会因为首批变小而多出一轮。
-    // 远端慢模型首字延迟高，首批再切小些：首条译文 = TTFT + 这一小撮的生成时间
-    const firstChars =
-      concurrency > 1
-        ? Math.min(local ? 200 : 120, Math.floor(totalChars / concurrency / 2))
-        : 0;
-    const restChars = Math.max(0, totalChars - firstChars);
-    // 留 10% 余量：首批实际装不满预估字符数，不留余量会多切出一批尾巴
-    const autoMax =
-      concurrency > 1
-        ? Math.ceil((restChars / (concurrency - 1)) * 1.1)
-        : restChars;
-    const maxChars = Math.max(300, Math.min(userMax, autoMax || userMax));
+    // 首批阈值：远端慢模型首字延迟高，首批再切小些。
+    // 首条译文 = 采集到这一小撮的时间 + TTFT + 这一小撮的生成时间。
+    // 并发 < 4 时服务端多半是串行（本地 Ollama 默认 num_parallel=1），
+    // 拆首批只是把一次请求变成两次串行，白白多付一个 TTFT，所以不拆
+    const firstChars = concurrency >= 4 ? (local ? 200 : 120) : 0;
 
-    const batches = DOM.batch(unique, {
-      maxChars,
-      // 64 条：字符上限 2500 装不满时，条数上限会成为批次数的主导因素
-      // （后台管理页 / 仪表盘大量 10~20 字短文本），64 行仍在模型稳定遵循范围内
-      maxItems: 64,
-      firstMaxChars: firstChars
-    });
+    // 每次全页翻译一个代号：停止后立刻重开时，上一轮的 worker 还在跑，
+    // 只看 state.cancel 会被新一轮重置成 false，必须用代号区分
+    const runId = (state.runId = (state.runId || 0) + 1);
+
+    const resuming = state.status === 'partial';
+    state.status = 'translating';
+    state.cancel = false;
+    // 续译时保留已有记录，否则「还原」只能撤回最后一段
+    if (!resuming) state.records = [];
+
+    /* ---- 采集与首批请求并行 ----
+       原来等整页扫完才发请求，大页面采集要几百毫秒，这段时间网络完全空闲。
+       现在边扫边把攒够阈值的一小批发出去，首条译文只需等这一小撮生成完。 */
+    const groups = new Map(); // 原文 -> 节点数组（写回时按原文找到所有相同节点）
+    let pending = []; // 已去重、尚未切批的 { text, list }
+    const batches = [];
+    let sealed = false; // 采集结束，批次不再增加
+    let waiters = [];
+    const notifyAll = () => {
+      const ws = waiters;
+      waiters = [];
+      for (const w of ws) w();
+    };
+    // 100ms 兜底：点「停止」时 worker 可能正等在这里，没有超时要等到采集结束才退出
+    const waitForWork = () =>
+      new Promise((r) => {
+        waiters.push(r);
+        setTimeout(r, 100);
+      });
+
+    let consumed = 0;
+    const absorb = (items) => {
+      for (; consumed < items.length; consumed++) {
+        const it = items[consumed];
+        const key = it.text.trim();
+        let list = groups.get(key);
+        if (!list) {
+          list = [];
+          groups.set(key, list);
+          pending.push({ text: key, list });
+        }
+        list.push(it);
+      }
+    };
+
+    let firstSent = false;
+    const sendFirst = () => {
+      if (firstSent || !firstChars) return;
+      // 采集很快的页面（小页面）拆首批只会多一次请求，收益为负：
+      // 采集 50ms 就结束，等它扫完直接切批反而更快
+      if (since() < 150) return;
+      let total = 0;
+      for (const g of pending) total += g.text.length;
+      if (total < firstChars) return;
+      // 按文档序取头部（页面顶部），不在这里做视口重排：
+      // 采集热路径上调用 getBoundingClientRect 会强制一次全页布局
+      let chars = 0;
+      let n = 0;
+      for (const g of pending) {
+        if (n && chars >= firstChars) break;
+        chars += g.text.length;
+        n++;
+      }
+      if (!n) return;
+      batches.push(pending.slice(0, n));
+      pending = pending.slice(n);
+      firstSent = true;
+      notifyAll();
+    };
+
+    // 视口优先：剩余批次按「是否在视口内」重排，用户滚到页面中部时先出眼前的内容。
+    // 首批已经发出，这里只影响剩余部分——首批只有一百多字符，代价可以忽略
+    const prioritizeGroups = (list) => {
+      if (list.length < 40) return list;
+      const vh = window.innerHeight || 800;
+      const vis = [];
+      const rest = [];
+      for (const g of list) {
+        const el = g.list[0] && g.list[0].node && g.list[0].node.parentElement;
+        const r = el && el.isConnected ? el.getBoundingClientRect() : null;
+        if (r && r.bottom > 0 && r.top < vh && r.width > 0 && r.height > 0) vis.push(g);
+        else rest.push(g);
+      }
+      return vis.concat(rest);
+    };
 
     // 后台标签页不触发 rAF，用定时器兜底，避免 worker 永远挂起。
     // 32ms 约等于 30fps 一帧：既让出主线程处理输入/绘制，又不会在后台标签页
@@ -288,12 +341,6 @@
         setTimeout(fin, 32);
       });
 
-    const resuming = state.status === 'partial';
-    state.status = 'translating';
-    state.cancel = false;
-    // 续译时保留已有记录，否则「还原」只能撤回最后一段
-    if (!resuming) state.records = [];
-
     let finished = 0;
     let failed = 0;
     let cursor = 0;
@@ -301,10 +348,18 @@
     let tFirst = 0; // 首条译文出现的时间点，体现"感觉快不快"
 
     const worker = async () => {
-      while (cursor < batches.length) {
-        if (state.cancel) return;
+      while (true) {
+        if (state.cancel || state.runId !== runId) return;
+        // 批次由采集进度动态追加：没有可取的批次就先等，采集结束后 sealed 才退出
+        if (cursor >= batches.length) {
+          if (sealed) return;
+          await waitForWork();
+          continue;
+        }
         const b = batches[cursor++];
         const texts = b.map((x) => x.text);
+        const bChars = texts.reduce((s, t) => s + t.length, 0);
+        const bStart = since();
         inFlight++;
         try {
 
@@ -350,8 +405,14 @@
         }
 
         finished++;
+        // 单批耗时：批大小不变但耗时变长，说明瓶颈在模型/接口；耗时随批大小线性增长才是正常
+        console.log(
+          `[LLMT] 第 ${finished} 批：${b.length} 条 / ${bChars} 字 / ${Math.round(since() - bStart)}ms`
+        );
         UI.flashToast(
-          `翻译中 ${Math.min(finished, batches.length)}/${batches.length} 批 · 并发 ${inFlight} · 已完成 ${state.records.length} 段`,
+          sealed
+            ? `翻译中 ${Math.min(finished, batches.length)}/${batches.length} 批 · 并发 ${inFlight} · 已完成 ${state.records.length} 段`
+            : `翻译中 · 并发 ${inFlight} · 已完成 ${state.records.length} 段`,
           60000
         );
 
@@ -363,9 +424,48 @@
       }
     };
 
-    await Promise.all(
-      Array.from({ length: Math.min(concurrency, batches.length) }, worker)
-    );
+    // 并发 worker 一次开满：首批一到就有一个取走，其余等采集结束后补齐
+    const workers = Array.from({ length: concurrency }, worker);
+
+    UI.flashToast('正在收集页面文本…', 4000);
+    const items = await DOM.collect(document.body, targetLang, (snapshot) => {
+      absorb(snapshot);
+      sendFirst();
+    });
+    const tCollect = since();
+    absorb(items);
+
+    if (!groups.size) {
+      sealed = true;
+      notifyAll();
+      await Promise.all(workers);
+      // 续译时没有新文本，要保持 partial，否则「再点翻译」会变成从头开始
+      state.status = resuming ? 'partial' : 'idle';
+      UI.flashToast('没有找到可翻译的文本');
+      return;
+    }
+
+    pending = prioritizeGroups(pending);
+
+    const restChars = pending.reduce((s, g) => s + g.text.length, 0);
+    const restWorkers = Math.max(1, concurrency - (firstSent ? 1 : 0));
+    // 批数对齐可用 worker 数：批数比 worker 多时，最后一波只有部分 worker 在跑。
+    // 4 万字符 / 2500 = 16 批、并发 12 要跑两波；按 3333 切就只有 12 批，一波跑完。
+    // 页面大到 autoMax 超过用户设的单批上限时，以「一波跑完」优先，但仍受硬上限约束。
+    const autoMax = Math.ceil((restChars / restWorkers) * 1.1);
+    const maxChars = Math.max(300, Math.min(MAX_BATCH_CHARS, Math.max(userMax, autoMax)));
+    // 条数上限同样要对齐：大量 10~20 字短文本时（后台管理页 / 仪表盘）字符上限
+    // 装不满，批数由条数决定，固定 64 条会让 1000 条短文本切出 16 批、跑两波。
+    // 96 行是模型稳定遵循编号输出的上限，个别漏行由缺失补译兜底
+    const maxItems = Math.min(96, Math.max(64, Math.ceil((pending.length / restWorkers) * 1.1)));
+    batches.push(...DOM.batch(pending, { maxChars, maxItems }));
+    sealed = true;
+    notifyAll();
+
+    await Promise.all(workers);
+
+    // 已经开了新一轮：这一轮的收尾不能再改状态，否则会把新一轮的进度覆盖掉
+    if (state.runId !== runId) return;
 
     if (state.cancel) {
       // 保留 partial：再点翻译接着译剩下的，点还原才清空

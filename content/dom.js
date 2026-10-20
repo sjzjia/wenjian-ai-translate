@@ -74,27 +74,45 @@
     return el.getClientRects().length > 0;
   }
 
-  /** 目标语言是否为中文（只有这种情况下才做"跳过纯中文"优化） */
-  function isChineseTarget(lang) {
-    return /中文|汉语|漢語|简体|繁體|繁体|chinese|^zh([-_]|$)/i.test(String(lang || ''));
+  /**
+   * 目标语言 → 文字系统。
+   * 拉丁语系（英/法/德/西…）共用 A-Z，字符集区分不出语种，硬判必然漏译，因此不参与跳过。
+   */
+  const TARGET_SCRIPT_RULES = [
+    { code: 'han', lang: /中文|汉语|漢語|简体|繁體|繁体|chinese|^zh([-_]|$)/i, chars: HAN_RE_G },
+    { code: 'kana', lang: /日本語|日语|日語|日文|japanese|^ja([-_]|$)/i, chars: /[\u3040-\u30ff]/g },
+    { code: 'hangul', lang: /한국어|韩语|韓語|korean|^ko([-_]|$)/i, chars: /[\uac00-\ud7af]/g },
+    { code: 'cyrillic', lang: /俄语|俄語|русск|russian|^ru([-_]|$)/i, chars: /[\u0400-\u04ff]/g },
+    { code: 'arabic', lang: /阿拉伯|عربي|arabic|^ar([-_]|$)/i, chars: /[\u0600-\u06ff]/g },
+    { code: 'greek', lang: /希腊|希臘|ελληνικ|greek|^el([-_]|$)/i, chars: /[\u0370-\u03ff]/g },
+    { code: 'hebrew', lang: /希伯来|希伯來|עברית|hebrew|^he([-_]|$)/i, chars: /[\u0590-\u05ff]/g },
+    { code: 'thai', lang: /泰语|泰語|ไทย|thai|^th([-_]|$)/i, chars: /[\u0e00-\u0e7f]/g }
+  ];
+
+  /** 目标语言对应的文字系统；拉丁语系等无法判定时返回 null（不做跳过） */
+  function targetScript(lang) {
+    const s = String(lang || '');
+    return TARGET_SCRIPT_RULES.find((r) => r.lang.test(s)) || null;
   }
 
   /**
-   * 文本是否以中文为主（目标语言为中文时用来跳过无需翻译的段落）。
+   * 文本是否已经是目标语言（按文字系统判断，用于跳过省 token）。
    * 不要求「一个拉丁字母都没有」：中文技术文档里「使用 React 构建」这类
    * 中英混排句子占比很高，按旧规则会整句送去翻译，白花 token 还可能译坏。
-   * 判据：汉字数 ≥ 拉丁字母数的一半，且不含假名 / 韩文。
+   * 判据：目标文字字符数 ≥ 拉丁字母数的一半。
    */
-  function isChineseDominant(t) {
-    if (KANA_HANGUL_RE.test(t)) return false;
-    const han = (t.match(HAN_RE_G) || []).length;
-    if (!han) return false;
+  function isScriptDominant(t, rule) {
+    if (!rule) return false;
+    // 中文页里夹的日文句子带假名，不能当成中文跳过；目标为日文时同理
+    if (rule.code === 'han' && KANA_HANGUL_RE.test(t)) return false;
+    const hits = (t.match(rule.chars) || []).length;
+    if (!hits) return false;
     const latin = (t.match(/[A-Za-z]/g) || []).length;
-    return han * 2 >= latin;
+    return hits * 2 >= latin;
   }
 
   /** 文本是否值得翻译 */
-  function isTranslatable(text, targetLang) {
+  function isTranslatable(text, script) {
     const t = text.trim();
     if (!t) return false;
     if (!TEXT_RE.test(t)) return false;            // 纯数字 / 符号 / emoji
@@ -103,14 +121,20 @@
     if (URL_RE.test(t) || EMAIL_RE.test(t) || VERSION_RE.test(t)) return false;
     if (ABBREVIATIONS.has(t) || ABBREVIATIONS.has(t.toUpperCase())) return false;
     if (UI_WORDS.has(t.toLowerCase())) return false;
-    // 仅当目标语言是中文时，跳过已经是中文的段落以减少无效请求。
-    // 其它目标语言（日、韩、英、法…）不做任何源语言过滤，保证任意语言互译。
-    if (isChineseTarget(targetLang) && isChineseDominant(t)) return false;
+    // 已经是目标语言的段落跳过：以前只对中文目标生效，日/韩/俄/阿等
+    // 文字系统明确的语言同样可判，省下的量在整页翻译里是最大的一块
+    if (isScriptDominant(t, script)) return false;
     return true;
   }
 
-  /** 单段文本的字符上限：与请求层输出估算配套，超长必须切分 */
-  const MAX_TEXT_CHARS = 4000;
+  /**
+   * 单段文本上限，同时也是译文缓存的粒度。
+   * 上限：与请求层 max_tokens 估算配套，整段过长会把译文拦腰截断。
+   * 粒度：缓存以「一段文本」为键，段落里改一个词就整段失效；切成 ≤1200 字的
+   * 句子组后，改动只影响所在的那一段，其余片段直接命中缓存（相邻片段仍排在
+   * 同一批里，上下文不丢）。再小会把长段落拆成太多行、写回要等全部到齐。
+   */
+  const MAX_TEXT_CHARS = 1200;
   // 在句子边界后切开，避免把单词 / 句子拦腰截断；单句本身超长时按字符硬切
   const SENTENCE_SPLIT_RE = /(?<=[。！？.!?]\s*)|(?<=\n)/;
 
@@ -176,10 +200,14 @@
    * 手动栈遍历而非 TreeWalker：父级不可见 / 命中跳过规则时整棵子树剪枝，
    * 隐藏的导航、菜单、代码块不会白遍历；子元素逆序入栈保证弹出仍是文档序。
    * 异步：每扫约 2000 个元素让出一次事件循环，大页面采集期间页面仍可响应。
+   * onProgress：每次让出时把当前已采集的数组传出去（同一个引用，调用方自己
+   * 记已消费的下标），调用方可以先发首批请求，不必等整页扫完。
    * @returns {Promise<Array<{node: Text, text: string, block: Element}>>}
    */
-  async function collect(root = document.body, targetLang = '简体中文') {
+  async function collect(root = document.body, targetLang = '简体中文', onProgress) {
     if (!root || root.nodeType !== 1) return [];
+    // 目标语言的文字系统只解析一次，逐节点判断时复用
+    const script = targetScript(targetLang);
     const items = [];
     const visCache = new WeakMap();
     const isVisibleCached = (el) => {
@@ -195,7 +223,11 @@
       const el = stack.pop();
       if (!el || el.nodeType !== 1) continue;
       // 每约 2000 个元素让出一次，保持页面可交互
-      if (guard % 2000 === 0) await yieldToEventLoop();
+      if (guard % 2000 === 0) {
+        await yieldToEventLoop();
+        // 边采边报：调用方拿到已采集部分就能先发请求，首屏不必等整页扫完
+        if (onProgress) onProgress(items);
+      }
       // 整棵子树跳过的规则放在这里，比 TreeWalker 逐文本节点判断省大量 closest 调用
       if (SKIP_TAGS.has(el.tagName)) continue;
       if (el.closest(`[${SKIP_ATTR}]`)) continue;
@@ -221,7 +253,7 @@
         if (!v || !v.trim()) continue;
         // 块里已经译过这段原文才跳过；换成新文本要重新译
         if (doneBlock && isAlreadyTranslated(doneBlock, v)) continue;
-        if (!isTranslatable(v, targetLang)) continue;
+        if (!isTranslatable(v, script)) continue;
         const segs = splitLongText(v);
         if (segs.length === 1) {
           items.push({ node: k, text: v, block: null });

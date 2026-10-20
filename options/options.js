@@ -15,7 +15,8 @@ const DEFAULTS = {
   autoFollow: true,
   skipSites: [],
   systemPrompt: '',
-  glossary: ''
+  glossary: '',
+  compactPrompt: true
 };
 
 const PRESETS = {
@@ -61,7 +62,8 @@ const BOOL_FIELDS = [
   'disableThinking',
   'hoverTranslate',
   'inputTranslate',
-  'autoFollow'
+  'autoFollow',
+  'compactPrompt'
 ];
 
 function readForm() {

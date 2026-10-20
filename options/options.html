@@ -197,8 +197,21 @@
           <label for="glossary">术语表（可选）</label>
           <textarea id="glossary" rows="4" placeholder="每行一条，格式：原文=译文&#10;例如：&#10;Transformer=Transformer&#10;prompt=提示词&#10;LLM=大语言模型"></textarea>
           <span class="tip">
-            强制指定品牌名、产品名、技术术语的译法，避免被意译。修改后旧缓存自动失效。
+            强制指定品牌名、产品名、技术术语的译法，避免被意译。只发送本批实际命中的条目，改一条无关术语不会让整站缓存失效。
           </span>
+        </div>
+
+        <div class="switch-row">
+          <div>
+            <div class="switch-title">极简提示词</div>
+            <div class="switch-desc">
+              内置提示词改用更短的写法，约束不变但每批少约 15 个字符，批次数多时累计可观。若模型开始漏行可关闭。
+            </div>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="compactPrompt" />
+            <span class="slider"></span>
+          </label>
         </div>
 
         <div class="switch-row">
@@ -215,7 +228,7 @@
           <span id="cacheHint" class="result"></span>
         </div>
         <span class="tip">
-          译文按「模型 + 目标语言 + 原文」缓存，重复翻译同一页面或相同段落时直接命中，几乎零延迟。
+          译文按「模型 + 目标语言 + 原文」缓存在 IndexedDB 里，最多两万条，重复翻译同一页面或相同段落时直接命中，几乎零延迟。
         </span>
       </section>
 
