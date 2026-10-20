@@ -1,0 +1,36 @@
+/* 双语对照模式：原文与译文的页面级样式（Shadow DOM 无法作用于页面元素，故单独注入） */
+
+.llmt-orig {
+  opacity: 0.72;
+}
+
+.llmt-trans {
+  color: inherit;
+  font: inherit;
+  background: rgba(37, 99, 235, 0.07);
+  border-radius: 3px;
+  padding: 0 2px;
+  margin-left: 4px;
+  text-decoration: none;
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+}
+
+.llmt-trans::before {
+  content: '';
+}
+
+/* 深色主题适配 */
+@media (prefers-color-scheme: dark) {
+  .llmt-trans {
+    background: rgba(96, 165, 250, 0.16);
+  }
+}
+
+/* 避免译文被页面的极端样式影响 */
+.llmt-trans,
+.llmt-orig {
+  text-transform: none;
+  letter-spacing: inherit;
+  word-spacing: inherit;
+}

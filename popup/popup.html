@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>AI 翻译</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header class="head">
+      <div class="brand">
+        <img class="logo" src="../icons/icon128.png" alt="AI 翻译" />
+        <div class="brand-text">
+          <strong>AI 翻译</strong>
+          <span class="sub" id="modelName">未配置模型</span>
+        </div>
+      </div>
+      <button class="icon-btn" id="openOptions" title="设置">⚙</button>
+    </header>
+
+    <main class="body">
+      <div class="row">
+        <label class="label" for="langSelect">目标语言</label>
+        <select id="langSelect" class="select">
+          <option value="简体中文">简体中文</option>
+          <option value="繁體中文">繁體中文</option>
+          <option value="English">English</option>
+          <option value="日本語">日本語</option>
+          <option value="한국어">한국어</option>
+          <option value="Français">Français</option>
+          <option value="Deutsch">Deutsch</option>
+          <option value="Español">Español</option>
+          <option value="Русский">Русский</option>
+          <option value="__custom__">自定义…</option>
+        </select>
+      </div>
+
+      <div class="row">
+        <label class="label" for="bilingual">双语对照</label>
+        <label class="switch">
+          <input type="checkbox" id="bilingual" />
+          <span class="slider"></span>
+        </label>
+      </div>
+
+      <button class="primary" id="translatePage">翻译整个页面</button>
+      <button class="ghost" id="restorePage">还原原文</button>
+
+      <div class="hint" id="status">提示：选中网页文字可划词翻译，Alt + 点击段落可单独翻译。</div>
+
+      <div class="history-bar">
+        <button class="link" id="toggleHistory" type="button">最近翻译</button>
+        <button class="link" id="clearHistory" type="button" hidden>清空</button>
+      </div>
+      <div class="history" id="history" hidden></div>
+    </main>
+
+    <footer class="foot">
+      <span id="pageState">就绪</span>
+      <a href="#" id="openOptions2">高级设置</a>
+    </footer>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

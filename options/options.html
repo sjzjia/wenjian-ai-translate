@@ -1,0 +1,231 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AI 翻译 · 设置</title>
+    <link rel="stylesheet" href="options.css" />
+  </head>
+  <body>
+    <div class="page">
+      <header class="hero">
+        <img class="logo" src="../icons/icon128.png" alt="AI 翻译" />
+        <div>
+          <h1>AI 翻译 · 设置</h1>
+          <p class="hero-sub">对接任意 OpenAI 兼容接口，实现全页面翻译与划词点译。</p>
+        </div>
+      </header>
+
+      <section class="card">
+        <h2>模型接口</h2>
+
+        <div class="field">
+          <label for="preset">快速填充</label>
+          <select id="preset">
+            <option value="">— 选择服务商 —</option>
+            <option value="openai">OpenAI</option>
+            <option value="deepseek">DeepSeek</option>
+            <option value="moonshot">Moonshot / Kimi</option>
+            <option value="dashscope">阿里通义千问</option>
+            <option value="zhipu">智谱 GLM</option>
+            <option value="ollama">本地 Ollama</option>
+            <option value="custom">自定义</option>
+          </select>
+        </div>
+
+        <div class="field">
+          <label for="baseUrl">Base URL</label>
+          <input id="baseUrl" type="text" placeholder="https://api.openai.com/v1" spellcheck="false" />
+          <span class="tip">需包含 /v1 等版本前缀，插件会自动拼接 /chat/completions。</span>
+          <span class="tip">本地 Ollama 若测试报 403：启动时加 <code>OLLAMA_ORIGINS=*</code> 放行扩展来源，例：<code>OLLAMA_ORIGINS=* ollama serve</code>。</span>
+        </div>
+
+        <div class="field">
+          <label for="apiKey">API Key</label>
+          <div class="input-row">
+            <input id="apiKey" type="password" placeholder="sk-..." spellcheck="false" autocomplete="off" />
+            <button class="btn ghost" id="toggleKey" type="button">显示</button>
+          </div>
+          <span class="tip">密钥仅保存在浏览器本地（chrome.storage.sync），不会上传到第三方。</span>
+        </div>
+
+        <div class="field">
+          <label for="model">模型名称</label>
+          <input id="model" type="text" placeholder="gpt-4o-mini" spellcheck="false" />
+        </div>
+
+        <div class="switch-row">
+          <div>
+            <div class="switch-title">关闭思考模式</div>
+            <div class="switch-desc">
+              翻译不需要推理链。按接口自动附加关闭参数（Ollama <code>think:false</code>、通义 <code>enable_thinking:false</code>、智谱 <code>thinking:disabled</code>），并清除混在正文里的思考内容，省 token 也更快。推理模型可取消勾选。
+            </div>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="disableThinking" />
+            <span class="slider"></span>
+          </label>
+        </div>
+
+        <div class="actions">
+          <button class="btn primary" id="testBtn" type="button">测试连接</button>
+          <span id="testResult" class="result"></span>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>翻译行为</h2>
+
+        <div class="grid">
+          <div class="field">
+            <label for="targetLang">目标语言</label>
+            <input id="targetLang" type="text" placeholder="简体中文" list="langList" />
+            <datalist id="langList">
+              <option value="简体中文"></option>
+              <option value="繁體中文"></option>
+              <option value="English"></option>
+              <option value="日本語"></option>
+              <option value="한국어"></option>
+              <option value="Français"></option>
+              <option value="Deutsch"></option>
+              <option value="Español"></option>
+              <option value="Русский"></option>
+            </datalist>
+            <span class="tip">可填写任意语言名称，如「粤语」「文言文」。</span>
+          </div>
+
+          <div class="field">
+            <label for="temperature">温度（0 - 1）</label>
+            <input id="temperature" type="number" min="0" max="2" step="0.1" />
+            <span class="tip">翻译建议 0.2 ~ 0.4，数值越低越稳定。</span>
+          </div>
+
+          <div class="field">
+            <label for="maxCharsPerBatch">单批字符数</label>
+            <input id="maxCharsPerBatch" type="number" min="200" max="8000" step="100" />
+            <span class="tip">数值越大请求数越少、整体越快，但更易被模型截断，建议 2000 ~ 3000。</span>
+          </div>
+
+          <div class="field">
+            <label for="concurrency">并发请求数</label>
+            <input id="concurrency" type="number" min="1" max="10" step="1" />
+            <span class="tip">同时发出的批次数。远端接口（API）默认 6、可到 10；本地模型自动降为 2（服务端串行，调高只会排队），填 7 以上可强制调高。翻译时进度提示会显示当前并发数。</span>
+          </div>
+        </div>
+
+        <div class="switch-row">
+          <div>
+            <div class="switch-title">双语对照</div>
+            <div class="switch-desc">保留原文，译文以行内高亮方式追加显示。</div>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="bilingual" />
+            <span class="slider"></span>
+          </label>
+        </div>
+
+        <div class="switch-row">
+          <div>
+            <div class="switch-title">划词自动翻译</div>
+            <div class="switch-desc">选中文字后立即翻译，无需点击「译」按钮。</div>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="autoTranslateSelection" />
+            <span class="slider"></span>
+          </label>
+        </div>
+
+        <div class="switch-row">
+          <div>
+            <div class="switch-title">外语页面自动提示</div>
+            <div class="switch-desc">
+              打开与系统语言不同的网页时，右下角提示是否翻译，可单独关闭某个站点。
+            </div>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="autoPrompt" />
+            <span class="slider"></span>
+          </label>
+        </div>
+
+        <div class="switch-row">
+          <div>
+            <div class="switch-title">Shift + 悬停翻译</div>
+            <div class="switch-desc">按住 Shift 把鼠标停在段落上约半秒，直接弹出译文，不必先选中。</div>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="hoverTranslate" />
+            <span class="slider"></span>
+          </label>
+        </div>
+
+        <div class="switch-row">
+          <div>
+            <div class="switch-title">输入框翻译</div>
+            <div class="switch-desc">在输入框或可编辑区域按 Alt + Enter 译成目标语言，再按一次撤销。</div>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="inputTranslate" />
+            <span class="slider"></span>
+          </label>
+        </div>
+
+        <div class="switch-row">
+          <div>
+            <div class="switch-title">动态内容翻译</div>
+            <div class="switch-desc">翻译完成后继续监听，滚动加载、展开评论、切换路由产生的新内容自动补译。</div>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="autoFollow" />
+            <span class="slider"></span>
+          </label>
+        </div>
+
+      </section>
+
+      <section class="card">
+        <h2>高级</h2>
+        <div class="field">
+          <label for="systemPrompt">自定义系统提示词（可选）</label>
+          <textarea id="systemPrompt" rows="5" placeholder="留空使用内置提示词。可用 {lang} 占位符代表目标语言。"></textarea>
+          <span class="tip">
+            内置提示词要求模型按「编号|译文」逐行输出，若自定义请保留「逐行对应」这一约束，否则可能解析失败。
+          </span>
+        </div>
+
+        <div class="field">
+          <label for="glossary">术语表（可选）</label>
+          <textarea id="glossary" rows="4" placeholder="每行一条，格式：原文=译文&#10;例如：&#10;Transformer=Transformer&#10;prompt=提示词&#10;LLM=大语言模型"></textarea>
+          <span class="tip">
+            强制指定品牌名、产品名、技术术语的译法，避免被意译。修改后旧缓存自动失效。
+          </span>
+        </div>
+
+        <div class="switch-row">
+          <div>
+            <div class="switch-title">累计用量</div>
+            <div class="switch-desc" id="usageText">加载中…</div>
+          </div>
+          <button class="btn ghost" id="resetUsage" type="button">清零</button>
+        </div>
+
+        <div class="actions">
+          <button class="btn ghost" id="clearCacheBtn" type="button">清除译文缓存</button>
+          <button class="btn ghost" id="resetSkipBtn" type="button">恢复所有站点提示</button>
+          <span id="cacheHint" class="result"></span>
+        </div>
+        <span class="tip">
+          译文按「模型 + 目标语言 + 原文」缓存，重复翻译同一页面或相同段落时直接命中，几乎零延迟。
+        </span>
+      </section>
+
+      <footer class="footer">
+        <button class="btn primary" id="saveBtn" type="button">保存设置</button>
+        <button class="btn ghost" id="resetBtn" type="button">恢复默认</button>
+        <span id="saveHint" class="result"></span>
+      </footer>
+    </div>
+
+    <script src="options.js"></script>
+  </body>
+</html>
